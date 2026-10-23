@@ -1,0 +1,18 @@
+# PRD / Internal Docs
+planning_poker_prd.md
+*prd*.md
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs & Temp
+*.log
+tmp/
+dist/
+node_modules/

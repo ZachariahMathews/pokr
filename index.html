@@ -1,0 +1,1916 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Planning Poker</title>
+  <meta name="description" content="Peer-to-peer Planning Poker for agile teams." />
+
+  <!-- Distinctive Typography: Bricolage Grotesque + Plus Jakarta Sans + DM Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,600;12..96,700;12..96,800&family=DM+Mono:wght@400;500&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            display: ['"Bricolage Grotesque"', 'sans-serif'],
+            sans: ['"Plus Jakarta Sans"', 'sans-serif'],
+            mono: ['"DM Mono"', 'monospace'],
+          },
+          colors: {
+            env: {
+              blue: '#0074bd',
+              darkblue: '#005f9e',
+              lightblue: '#8bd3e6',
+              green: '#00818f',
+              orange: '#f46b10',
+              gold: '#fdb515',
+              darkgray: '#343741',
+              lightgray: '#d8dcdb',
+            }
+          }
+        }
+      }
+    };
+  </script>
+
+  <!-- PeerJS & MQTT.js -->
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+
+  <style>
+    :root {
+      --bg-canvas: #F3F5F5;
+      --bg-surface: #FFFFFF;
+      --bg-table: #E8ECEB;
+      --border-subtle: #d8dcdb;
+      --border-strong: #b6bcbd;
+      --text-primary: #343741;
+      --text-secondary: #5c606d;
+      --text-muted: #858994;
+      --accent: #0074bd;
+      --accent-dark: #005f9e;
+      --accent-light: #8bd3e6;
+      --card-shadow: 0 4px 12px -2px rgba(52, 55, 65, 0.08), 0 1px 2px rgba(52, 55, 65, 0.06);
+    }
+
+    html.dark {
+      --bg-canvas: #1E2026;
+      --bg-surface: #282B33;
+      --bg-table: #22252C;
+      --border-subtle: #343741;
+      --border-strong: #494D5A;
+      --text-primary: #F3F5F5;
+      --text-secondary: #d8dcdb;
+      --text-muted: #8A8F99;
+      --accent: #0074bd;
+      --accent-dark: #005f9e;
+      --accent-light: #8bd3e6;
+      --card-shadow: 0 10px 24px -4px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.35);
+    }
+
+    body {
+      background-color: var(--bg-canvas);
+      color: var(--text-primary);
+      font-family: 'Plus Jakarta Sans', sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* Subtle architectural dot matrix on table surface */
+    .table-mat {
+      background-color: var(--bg-table);
+      background-image: radial-gradient(var(--border-subtle) 1px, transparent 1px);
+      background-size: 20px 20px;
+    }
+
+    /* 3D Card Flip Mechanics */
+    .card-perspective {
+      perspective: 1100px;
+    }
+    .card-inner {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      transition: transform 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+      transform-style: preserve-3d;
+    }
+    .card-inner.is-flipped {
+      transform: rotateY(180deg);
+    }
+    .card-face {
+      position: absolute;
+      inset: 0;
+      backface-visibility: hidden;
+      -webkit-backface-visibility: hidden;
+    }
+    .card-face-back {
+      transform: rotateY(180deg);
+    }
+
+    /* Tactile Engraved Card Back Pattern when Committed */
+    .card-back-engraved {
+      background-color: #005f9e;
+      background-image:
+        repeating-linear-gradient(
+          45deg,
+          rgba(139, 211, 230, 0.16) 0px,
+          rgba(139, 211, 230, 0.16) 2px,
+          transparent 2px,
+          transparent 7px
+        ),
+        repeating-linear-gradient(
+          -45deg,
+          rgba(139, 211, 230, 0.1) 0px,
+          rgba(139, 211, 230, 0.1) 2px,
+          transparent 2px,
+          transparent 7px
+        );
+    }
+
+    /* Hand Picker Card Physics */
+    .hand-card {
+      box-shadow: var(--card-shadow);
+      transition:
+        transform 0.22s cubic-bezier(0.16, 1, 0.3, 1),
+        border-color 0.18s ease,
+        background-color 0.18s ease,
+        box-shadow 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .hand-card:hover:not(:disabled):not(.selected) {
+      transform: translateY(-6px);
+    }
+    .hand-card.selected {
+      transform: translateY(-14px);
+      box-shadow: 0 12px 24px -6px rgba(0, 116, 189, 0.4);
+    }
+
+    /* Thinking Pulse */
+    @keyframes pulseDot {
+      0%, 80%, 100% { opacity: 0.25; transform: scale(0.85); }
+      40% { opacity: 1; transform: scale(1.1); }
+    }
+    .thinking-dot:nth-child(1) { animation: pulseDot 1.4s infinite ease-in-out 0s; }
+    .thinking-dot:nth-child(2) { animation: pulseDot 1.4s infinite ease-in-out 0.2s; }
+    .thinking-dot:nth-child(3) { animation: pulseDot 1.4s infinite ease-in-out 0.4s; }
+
+    /* Distribution Vertical Bar Fill */
+    .dist-bar-fill {
+      transition: height 0.65s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    /* Hide scrollbar on card dock while keeping scrollability */
+    .no-scrollbar::-webkit-scrollbar {
+      display: none;
+    }
+    .no-scrollbar {
+      -ms-overflow-style: none;
+      scrollbar-width: none;
+    }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col selection:bg-env-blue selection:text-white">
+
+  <!-- ===================================================================== -->
+  <!-- HEADER BAR                                                            -->
+  <!-- ===================================================================== -->
+  <header class="h-14 border-b border-[var(--border-subtle)] bg-[var(--bg-surface)] px-4 sm:px-6 flex items-center justify-between gap-4 shrink-0">
+    <!-- Left: Wordmark + Room Identifier + Copy Link -->
+    <div class="flex items-center gap-3 min-w-0">
+      <a href="#" id="logo-link" class="font-display font-bold text-base tracking-tight focus:outline-none hover:text-env-blue dark:hover:text-env-lightblue transition-colors" title="Return to Lobby">
+        Planning Poker
+      </a>
+
+      <!-- Room Controls (Visible inside a room) -->
+      <div id="header-room-controls" class="hidden items-center gap-2 pl-3 border-l border-[var(--border-subtle)] min-w-0">
+        <div class="font-mono text-xs px-2.5 py-1 rounded-md bg-[var(--bg-table)] border border-[var(--border-subtle)] truncate max-w-[160px] sm:max-w-[240px]">
+          <span class="text-env-blue dark:text-env-lightblue">#</span><span id="header-room-name">sprint-44</span>
+        </div>
+
+        <button
+          id="btn-copy-link"
+          type="button"
+          class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium border border-[var(--border-subtle)] hover:border-env-blue dark:hover:border-env-lightblue bg-[var(--bg-canvas)] transition-colors active:scale-95 shrink-0"
+        >
+          <svg class="w-3.5 h-3.5 text-[var(--text-secondary)]" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+          </svg>
+          <span id="copy-link-text">Copy Link</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Right: Profile + Theme -->
+    <div class="flex items-center gap-2.5">
+      <button
+        id="btn-edit-profile"
+        type="button"
+        class="hidden items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium border border-[var(--border-subtle)] hover:border-env-blue dark:hover:border-env-lightblue bg-[var(--bg-canvas)] transition-colors"
+        title="Edit name or observer role"
+      >
+        <span id="mesh-status-dot" class="w-1.5 h-1.5 rounded-full bg-env-green"></span>
+        <span id="header-my-name" class="max-w-[110px] truncate">Me</span>
+      </button>
+
+      <button
+        id="btn-theme-toggle"
+        type="button"
+        class="w-8 h-8 rounded-md flex items-center justify-center border border-[var(--border-subtle)] hover:border-[var(--border-strong)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
+        aria-label="Toggle color theme"
+        title="Switch theme"
+      >
+        <svg class="w-4 h-4 hidden dark:block" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+        </svg>
+        <svg class="w-4 h-4 block dark:hidden" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ===================================================================== -->
+  <!-- VIEW 1: LOBBY (Section 3.1 - Upfront Ceremony Prep)                   -->
+  <!-- ===================================================================== -->
+  <main id="view-lobby" class="flex-1 flex items-center justify-center p-4">
+    <div class="w-full max-w-md bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-2xl p-6 sm:p-8 shadow-sm">
+      <div class="mb-6">
+        <div class="font-mono text-[11px] uppercase tracking-widest text-env-blue dark:text-env-lightblue mb-1">
+          Estimation Ceremony
+        </div>
+        <h1 class="font-display text-2xl sm:text-3xl font-bold tracking-tight">
+          Start or Join a Room
+        </h1>
+      </div>
+
+      <form id="form-create-room" class="space-y-4">
+        <div>
+          <label for="input-room-slug" class="block text-xs font-medium text-[var(--text-secondary)] mb-1.5">
+            Room Identifier
+          </label>
+          <div class="relative flex items-center">
+            <span class="absolute left-3.5 font-mono text-sm text-[var(--text-muted)] select-none">#</span>
+            <input
+              id="input-room-slug"
+              type="text"
+              placeholder="core-sprint-44"
+              autocomplete="off"
+              spellcheck="false"
+              class="w-full pl-8 pr-3.5 py-2.5 rounded-lg bg-[var(--bg-canvas)] border border-[var(--border-subtle)] focus:border-env-blue dark:focus:border-env-lightblue font-mono text-sm outline-none transition-colors"
+            />
+          </div>
+        </div>
+
+        <div class="flex flex-col sm:flex-row gap-2.5 pt-1">
+          <button
+            type="submit"
+            class="flex-1 py-2.5 px-4 rounded-lg font-medium text-sm bg-env-blue hover:bg-env-darkblue text-white transition-colors active:scale-[0.99]"
+          >
+            Enter Room
+          </button>
+
+          <button
+            id="btn-instant-room"
+            type="button"
+            class="py-2.5 px-4 rounded-lg font-medium text-sm border border-[var(--border-subtle)] hover:border-env-blue dark:hover:border-env-lightblue bg-[var(--bg-canvas)] transition-colors active:scale-[0.99]"
+          >
+            Generate Instant Room
+          </button>
+        </div>
+
+        <div class="pt-3 border-t border-[var(--border-subtle)] flex items-center justify-between">
+          <span id="lobby-url-preview-text" class="font-mono text-[11px] text-[var(--text-muted)] truncate max-w-[200px]"></span>
+          <button
+            id="btn-lobby-copy"
+            type="button"
+            class="font-mono text-xs font-medium text-env-blue dark:text-env-lightblue hover:underline shrink-0"
+          >
+            <span id="lobby-copy-text">Copy Invite Link</span>
+          </button>
+        </div>
+      </form>
+    </div>
+  </main>
+
+  <!-- ===================================================================== -->
+  <!-- VIEW 2: CEREMONY ROOM                                                 -->
+  <!-- ===================================================================== -->
+  <main id="view-room" class="hidden flex-1 flex flex-col md:flex-row max-w-6xl w-full mx-auto px-4 sm:px-6 py-4 gap-4">
+
+    <!-- LEFT SIDEBAR: PARTICIPANTS (Voted / Waiting / Observer) -->
+    <aside class="w-full md:w-56 shrink-0 bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-2xl p-4 flex flex-col gap-5">
+      <!-- Vacant Crown Claim Button (shown only if no host in room) -->
+      <div id="vacant-lead-banner" class="hidden">
+        <button
+          id="btn-claim-lead"
+          type="button"
+          class="w-full py-1.5 px-3 rounded-lg font-medium text-xs bg-env-gold/20 hover:bg-env-gold text-[var(--text-primary)] hover:text-env-darkgray border border-env-gold/40 transition-colors flex items-center justify-center gap-1.5"
+        >
+          <span>👑</span>
+          <span>Claim</span>
+        </button>
+      </div>
+
+      <!-- 1. Voted -->
+      <div>
+        <div class="font-mono text-[10px] uppercase tracking-wider text-env-green dark:text-env-lightblue mb-2">
+          Voted
+        </div>
+        <ul id="sidebar-list-voted" class="space-y-1 text-xs"></ul>
+      </div>
+
+      <!-- 2. Waiting -->
+      <div>
+        <div class="font-mono text-[10px] uppercase tracking-wider text-env-orange mb-2">
+          Waiting
+        </div>
+        <ul id="sidebar-list-waiting" class="space-y-1 text-xs"></ul>
+      </div>
+
+      <!-- 3. Observer -->
+      <div>
+        <div class="font-mono text-[10px] uppercase tracking-wider text-[var(--text-muted)] mb-2">
+          Observer
+        </div>
+        <ul id="sidebar-list-observer" class="space-y-1 text-xs"></ul>
+      </div>
+    </aside>
+
+    <!-- RIGHT MAIN COLUMN: MIDDLE AREA + HOST CONTROLS + HAND -->
+    <div class="flex-1 flex flex-col gap-4 min-w-0 justify-between">
+
+      <!-- MIDDLE AREA (Voted Cards + Vertical Distribution Bar Chart + Host FABs) -->
+      <section class="relative flex-1 table-mat border border-[var(--border-subtle)] rounded-2xl p-6 pb-16 flex flex-col items-center justify-center gap-8 min-h-[280px]">
+        <!-- Vertical Bar Chart (Appears upon reveal, only bars + story point number) -->
+        <div id="section-distribution" class="hidden items-end justify-center gap-5 pt-2">
+          <div id="distribution-bars" class="flex items-end justify-center gap-4">
+            <!-- Vertical bars rendered dynamically -->
+          </div>
+        </div>
+
+        <!-- Voted Participants Cards -->
+        <div id="participants-grid" class="w-full flex flex-wrap items-center justify-center gap-5">
+          <!-- Only participants who have voted are rendered here -->
+        </div>
+
+        <!-- HOST FAB CONTROLS (Bottom-right corner of middle section, shown only for host) -->
+        <div id="section-host-controls" class="hidden absolute bottom-4 right-4 z-10 items-center gap-2">
+          <button
+            id="btn-reveal-cards"
+            type="button"
+            class="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-full font-medium text-xs bg-env-blue hover:bg-env-darkblue disabled:opacity-35 disabled:pointer-events-none text-white shadow-lg transition-all active:scale-95"
+          >
+            <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+              <path stroke-linecap="round" stroke-linejoin="round" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+            </svg>
+            <span>Reveal</span>
+          </button>
+
+          <button
+            id="btn-reset-board"
+            type="button"
+            class="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-full font-medium text-xs border border-[var(--border-subtle)] hover:border-env-blue dark:hover:border-env-lightblue bg-[var(--bg-surface)] disabled:opacity-35 disabled:pointer-events-none shadow-lg transition-all active:scale-95"
+          >
+            <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+            </svg>
+            <span>Reset</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- YOUR HAND (Card Picker) -->
+      <section class="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-xl px-4 py-3">
+        <!-- Observer Notice -->
+        <div id="observer-hand-notice" class="hidden py-3 text-center text-xs text-[var(--text-secondary)]">
+          Joined as <strong>Observer</strong>.
+          <button id="btn-switch-to-voter" type="button" class="ml-2 text-env-blue dark:text-env-lightblue font-medium hover:underline">
+            Switch to Voter
+          </button>
+        </div>
+
+        <!-- Fibonacci Deck -->
+        <div id="fibonacci-deck" class="no-scrollbar flex items-center justify-start sm:justify-center gap-2 overflow-x-auto pt-5 pb-1.5 px-1">
+          <!-- 0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, '?', '☕' -->
+        </div>
+      </section>
+
+    </div>
+  </main>
+
+  <!-- ===================================================================== -->
+  <!-- ONBOARDING MODAL (Section 3.2)                                        -->
+  <!-- ===================================================================== -->
+  <div id="modal-onboarding" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/65 backdrop-blur-xs p-4">
+    <div class="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-2xl max-w-sm w-full p-6 shadow-xl space-y-5">
+      <div class="flex items-center justify-between">
+        <div>
+          <div id="modal-room-label" class="font-mono text-xs text-env-blue dark:text-env-lightblue">#sprint-44</div>
+          <h3 class="font-display text-lg font-bold">Enter Your Name</h3>
+        </div>
+        <button id="btn-close-onboarding" type="button" class="hidden text-sm text-[var(--text-secondary)] hover:text-[var(--text-primary)]">
+          ✕
+        </button>
+      </div>
+
+      <form id="form-onboarding" class="space-y-4">
+        <div>
+          <label for="input-display-name" class="block text-xs font-medium text-[var(--text-secondary)] mb-1.5">
+            Display Name
+          </label>
+          <input
+            id="input-display-name"
+            type="text"
+            required
+            maxlength="28"
+            placeholder="Sarah"
+            class="w-full px-3.5 py-2.5 rounded-lg bg-[var(--bg-canvas)] border border-[var(--border-subtle)] focus:border-env-blue dark:focus:border-env-lightblue text-sm outline-none transition-colors"
+          />
+        </div>
+
+        <label class="flex items-center gap-2.5 cursor-pointer select-none">
+          <input
+            id="input-is-observer"
+            type="checkbox"
+            class="w-4 h-4 rounded accent-env-blue"
+          />
+          <span class="text-xs text-[var(--text-secondary)]">Join as Observer (read-only)</span>
+        </label>
+
+        <button
+          type="submit"
+          class="w-full py-2.5 px-4 rounded-lg font-medium text-sm bg-env-blue hover:bg-env-darkblue text-white transition-colors"
+        >
+          Join Room
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- CONFETTI CANVAS OVERLAY -->
+  <canvas id="confetti-canvas" class="fixed inset-0 pointer-events-none z-50 hidden"></canvas>
+
+  <!-- ===================================================================== -->
+  <!-- APPLICATION LOGIC                                                     -->
+  <!-- ===================================================================== -->
+  <script>
+    (() => {
+      'use strict';
+
+      // -------------------------------------------------------------------
+      // 1. CONSTANTS & CONFIGURATION
+      // -------------------------------------------------------------------
+      const FIB_DECK = [0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, '?', '☕'];
+
+      const MQTT_BROKERS = [
+        'wss://broker.emqx.io:8084/mqtt',
+        'wss://test.mosquitto.org:8081/mqtt',
+        'wss://broker.hivemq.com:8884/mqtt'
+      ];
+
+      const STORAGE_KEYS = {
+        THEME: 'pokr_theme',
+        NAME: 'pokr_display_name',
+        OBSERVER: 'pokr_is_observer',
+        SESSION_PREFIX: 'pokr_session_'
+      };
+
+      // -------------------------------------------------------------------
+      // 2. APPLICATION STATE
+      // -------------------------------------------------------------------
+      const state = {
+        roomName: '',
+        myPeerId: '',
+        myName: localStorage.getItem(STORAGE_KEYS.NAME) || '',
+        myIsObserver: localStorage.getItem(STORAGE_KEYS.OBSERVER) === 'true',
+        joinedAt: Date.now(),
+
+        hostPeerId: null,
+        isRevealed: false,
+        confettiFiredForRound: false,
+
+        myVote: null,       // FibValue | null
+        mySalt: null,       // 16-char hex string (8 random bytes)
+        myCommitHash: null, // 64-char hex string SHA-256(value + ":" + salt)
+
+        peers: new Map(),
+
+        peerInstance: null,
+        dataChannels: new Map(),
+        mqttClient: null,
+        broadcastChannel: null,
+        announceTimer: null,
+        hostElectionTimer: null,
+        isOnboarded: false
+      };
+
+      // -------------------------------------------------------------------
+      // 3. DOM REFERENCES
+      // -------------------------------------------------------------------
+      const el = {
+        viewLobby: document.getElementById('view-lobby'),
+        viewRoom: document.getElementById('view-room'),
+        headerRoomControls: document.getElementById('header-room-controls'),
+        headerRoomName: document.getElementById('header-room-name'),
+        btnCopyLink: document.getElementById('btn-copy-link'),
+        copyLinkText: document.getElementById('copy-link-text'),
+        meshStatusDot: document.getElementById('mesh-status-dot'),
+        btnEditProfile: document.getElementById('btn-edit-profile'),
+        headerMyName: document.getElementById('header-my-name'),
+        btnThemeToggle: document.getElementById('btn-theme-toggle'),
+
+        vacantLeadBanner: document.getElementById('vacant-lead-banner'),
+        btnClaimLead: document.getElementById('btn-claim-lead'),
+
+        // Sidebar Lists
+        sidebarListVoted: document.getElementById('sidebar-list-voted'),
+        sidebarListWaiting: document.getElementById('sidebar-list-waiting'),
+        sidebarListObserver: document.getElementById('sidebar-list-observer'),
+
+        // Lobby
+        formCreateRoom: document.getElementById('form-create-room'),
+        inputRoomSlug: document.getElementById('input-room-slug'),
+        lobbyUrlPreviewText: document.getElementById('lobby-url-preview-text'),
+        btnInstantRoom: document.getElementById('btn-instant-room'),
+        btnLobbyCopy: document.getElementById('btn-lobby-copy'),
+        lobbyCopyText: document.getElementById('lobby-copy-text'),
+
+        // Room
+        sectionDistribution: document.getElementById('section-distribution'),
+        distributionBars: document.getElementById('distribution-bars'),
+        participantsGrid: document.getElementById('participants-grid'),
+
+        // Controls
+        sectionHostControls: document.getElementById('section-host-controls'),
+        btnRevealCards: document.getElementById('btn-reveal-cards'),
+        btnResetBoard: document.getElementById('btn-reset-board'),
+
+        // Hand
+        observerHandNotice: document.getElementById('observer-hand-notice'),
+        btnSwitchToVoter: document.getElementById('btn-switch-to-voter'),
+        fibonacciDeck: document.getElementById('fibonacci-deck'),
+
+        // Onboarding Modal
+        modalOnboarding: document.getElementById('modal-onboarding'),
+        modalRoomLabel: document.getElementById('modal-room-label'),
+        btnCloseOnboarding: document.getElementById('btn-close-onboarding'),
+        formOnboarding: document.getElementById('form-onboarding'),
+        inputDisplayName: document.getElementById('input-display-name'),
+        inputIsObserver: document.getElementById('input-is-observer'),
+        confettiCanvas: document.getElementById('confetti-canvas')
+      };
+
+      // -------------------------------------------------------------------
+      // CONFETTI ANIMATION (Thrown from bottom middle of screen)
+      // -------------------------------------------------------------------
+      let confettiRafId = null;
+
+      function launchBottomMiddleConfetti() {
+        const canvas = el.confettiCanvas;
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+
+        if (confettiRafId) {
+          cancelAnimationFrame(confettiRafId);
+          confettiRafId = null;
+        }
+
+        const dpr = window.devicePixelRatio || 1;
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+        canvas.width = width * dpr;
+        canvas.height = height * dpr;
+        canvas.style.width = `${width}px`;
+        canvas.style.height = `${height}px`;
+        ctx.scale(dpr, dpr);
+
+        canvas.classList.remove('hidden');
+
+        const palette = ['#0074bd', '#005f9e', '#8bd3e6', '#00818f', '#f46b10', '#fdb515'];
+        const count = 110;
+        const originX = width / 2;
+        const originY = height + 10;
+
+        const particles = Array.from({ length: count }, () => {
+          // Throw upward in a fan from bottom-center (-90 deg is straight up)
+          const spreadRad = (Math.random() - 0.5) * 1.15; // ~65 deg cone
+          const angle = -Math.PI / 2 + spreadRad;
+          const speed = 14 + Math.random() * 14;
+          return {
+            x: originX + (Math.random() - 0.5) * 40,
+            y: originY,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed,
+            w: 7 + Math.random() * 6,
+            h: 4 + Math.random() * 5,
+            color: palette[Math.floor(Math.random() * palette.length)],
+            rotation: Math.random() * Math.PI * 2,
+            rotationSpeed: (Math.random() - 0.5) * 0.22,
+            tilt: Math.random() * Math.PI * 2,
+            tiltSpeed: 0.08 + Math.random() * 0.14,
+            alpha: 1,
+            decay: 0.008 + Math.random() * 0.008
+          };
+        });
+
+        const gravity = 0.36;
+        const drag = 0.985;
+
+        function tick() {
+          ctx.clearRect(0, 0, width, height);
+          let alive = 0;
+
+          for (let i = 0; i < particles.length; i++) {
+            const p = particles[i];
+            if (p.alpha <= 0) continue;
+
+            p.vx *= drag;
+            p.vy = p.vy * drag + gravity;
+            p.x += p.vx;
+            p.y += p.vy;
+            p.rotation += p.rotationSpeed;
+            p.tilt += p.tiltSpeed;
+
+            // Start fading once velocity turns downward or after peak
+            if (p.vy > -1) {
+              p.alpha -= p.decay;
+            }
+
+            if (p.alpha > 0 && p.y < height + 40) {
+              alive++;
+              ctx.save();
+              ctx.globalAlpha = Math.max(0, p.alpha);
+              ctx.translate(p.x, p.y);
+              ctx.rotate(p.rotation);
+              ctx.scale(1, Math.cos(p.tilt));
+              ctx.fillStyle = p.color;
+              ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
+              ctx.restore();
+            } else {
+              p.alpha = 0;
+            }
+          }
+
+          if (alive > 0) {
+            confettiRafId = requestAnimationFrame(tick);
+          } else {
+            ctx.clearRect(0, 0, width, height);
+            canvas.classList.add('hidden');
+            confettiRafId = null;
+          }
+        }
+
+        confettiRafId = requestAnimationFrame(tick);
+      }
+
+      // -------------------------------------------------------------------
+      // 4. CRYPTOGRAPHIC COMMIT-REVEAL (Section 3.4)
+      // -------------------------------------------------------------------
+      function generateSaltHex() {
+        const bytes = new Uint8Array(8);
+        crypto.getRandomValues(bytes);
+        return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+      }
+
+      async function computeCommitHash(value, salt) {
+        const input = `${value}:${salt}`;
+        const encoded = new TextEncoder().encode(input);
+        const digestBuffer = await crypto.subtle.digest('SHA-256', encoded);
+        const hashBytes = new Uint8Array(digestBuffer);
+        return Array.from(hashBytes, b => b.toString(16).padStart(2, '0')).join('');
+      }
+
+      // -------------------------------------------------------------------
+      // 5. HELPERS & SESSION STORAGE
+      // -------------------------------------------------------------------
+      function sanitizeRoomName(raw) {
+        return String(raw || '')
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-z0-9-_]/g, '-')
+          .replace(/-+/g, '-')
+          .replace(/^-|-$/g, '')
+          .slice(0, 48);
+      }
+
+      function generateRandomSlug() {
+        const words = ['core', 'mercury', 'atlas', 'nova', 'apex', 'vector', 'pulse', 'nimbus'];
+        const pick = words[Math.floor(Math.random() * words.length)];
+        const num = Math.floor(10 + Math.random() * 89);
+        return `${pick}-sprint-${num}`;
+      }
+
+      function saveSessionVoteState() {
+        if (!state.roomName) return;
+        try {
+          sessionStorage.setItem(
+            STORAGE_KEYS.SESSION_PREFIX + state.roomName,
+            JSON.stringify({
+              onboarded: state.isOnboarded,
+              joinedAt: state.joinedAt,
+              myVote: state.myVote,
+              mySalt: state.mySalt,
+              myCommitHash: state.myCommitHash
+            })
+          );
+        } catch (_) {}
+      }
+
+      function loadSessionVoteState(roomName) {
+        try {
+          const raw = sessionStorage.getItem(STORAGE_KEYS.SESSION_PREFIX + roomName);
+          return raw ? JSON.parse(raw) : null;
+        } catch (_) {
+          return null;
+        }
+      }
+
+      function normalizeFibValue(val) {
+        if (val === '?' || val === '☕') return val;
+        if (val === null || val === undefined || val === '') return null;
+        const num = Number(val);
+        if (!Number.isNaN(num) && FIB_DECK.includes(num)) return num;
+        return null;
+      }
+
+      function escapeHtml(str) {
+        return String(str ?? '')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;');
+      }
+
+      // -------------------------------------------------------------------
+      // 6. THEME
+      // -------------------------------------------------------------------
+      function initTheme() {
+        const saved = localStorage.getItem(STORAGE_KEYS.THEME);
+        if (saved === 'light') {
+          document.documentElement.classList.remove('dark');
+        } else {
+          document.documentElement.classList.add('dark');
+        }
+      }
+
+      function toggleTheme() {
+        const isDark = document.documentElement.classList.toggle('dark');
+        localStorage.setItem(STORAGE_KEYS.THEME, isDark ? 'dark' : 'light');
+      }
+
+      // -------------------------------------------------------------------
+      // 7. STATE & MESH TRANSPORT (Sections 4 & 5)
+      // -------------------------------------------------------------------
+      function updateSelfInPeersMap() {
+        if (!state.myPeerId) return;
+        const existing = state.peers.get(state.myPeerId) || {};
+        state.peers.set(state.myPeerId, {
+          ...existing,
+          peerId: state.myPeerId,
+          name: state.myName || 'Anonymous',
+          isHost: state.hostPeerId === state.myPeerId,
+          isObserver: state.myIsObserver,
+          commitHash: state.myCommitHash,
+          revealedVote: state.isRevealed ? state.myVote : null,
+          revealedSalt: state.isRevealed ? state.mySalt : null,
+          verified: state.isRevealed && state.myVote !== null ? true : null,
+          joinedAt: state.joinedAt,
+          connected: true,
+          isSelf: true
+        });
+      }
+
+      function buildSyncMeMessage() {
+        return {
+          type: 'SYNC_ME',
+          payload: {
+            peerId: state.myPeerId,
+            name: state.myName || 'Anonymous',
+            isHost: state.hostPeerId === state.myPeerId,
+            isObserver: state.myIsObserver,
+            commitHash: state.myCommitHash,
+            revealedVote: state.isRevealed ? state.myVote : null,
+            revealedSalt: state.isRevealed ? state.mySalt : null,
+            isRevealed: state.isRevealed,
+            joinedAt: state.joinedAt
+          }
+        };
+      }
+
+      function buildSyncRoomStateMessage() {
+        const committedPeers = [];
+        state.peers.forEach((p, id) => {
+          if (p.commitHash) committedPeers.push(id);
+        });
+        return {
+          type: 'SYNC_ROOM_STATE',
+          payload: {
+            hostPeerId: state.hostPeerId,
+            isRevealed: state.isRevealed,
+            committedPeers
+          }
+        };
+      }
+
+      function broadcastToMesh(message) {
+        state.dataChannels.forEach((conn) => {
+          if (conn && conn.open) {
+            try { conn.send(message); } catch (_) {}
+          }
+        });
+        if (state.broadcastChannel) {
+          try {
+            state.broadcastChannel.postMessage({
+              __bridge: 'DATA',
+              fromPeerId: state.myPeerId,
+              message
+            });
+          } catch (_) {}
+        }
+      }
+
+      function sendToPeer(peerId, message) {
+        const conn = state.dataChannels.get(peerId);
+        if (conn && conn.open) {
+          try {
+            conn.send(message);
+            return;
+          } catch (_) {}
+        }
+        if (state.broadcastChannel) {
+          try {
+            state.broadcastChannel.postMessage({
+              __bridge: 'DATA_DIRECT',
+              fromPeerId: state.myPeerId,
+              toPeerId: peerId,
+              message
+            });
+          } catch (_) {}
+        }
+      }
+
+      // -------------------------------------------------------------------
+      // 8. DISCOVERY & HANDSHAKE (Section 4.1 - 4.3)
+      // -------------------------------------------------------------------
+      function getDiscoveryTopic() {
+        return `poker/rooms/${state.roomName}/discovery`;
+      }
+
+      function publishPresenceAnnouncement() {
+        if (!state.myPeerId || !state.roomName) return;
+        const payload = {
+          type: 'ANNOUNCE_PRESENCE',
+          peerId: state.myPeerId,
+          name: state.myName || 'Anonymous',
+          joinedAt: state.joinedAt
+        };
+        const topic = getDiscoveryTopic();
+
+        if (state.mqttClient && state.mqttClient.connected) {
+          try {
+            state.mqttClient.publish(topic, JSON.stringify(payload), { qos: 0 });
+          } catch (_) {}
+        }
+
+        if (state.broadcastChannel) {
+          try {
+            state.broadcastChannel.postMessage({
+              __bridge: 'DISCOVERY',
+              payload
+            });
+          } catch (_) {}
+        }
+      }
+
+      function handlePresenceAnnouncement(data) {
+        if (!data || data.type !== 'ANNOUNCE_PRESENCE') return;
+        const incomingPeerId = data.peerId;
+        if (!incomingPeerId || incomingPeerId === state.myPeerId) return;
+
+        const existing = state.peers.get(incomingPeerId);
+        if (!existing) {
+          state.peers.set(incomingPeerId, {
+            peerId: incomingPeerId,
+            name: data.name || 'Peer',
+            isHost: state.hostPeerId === incomingPeerId,
+            isObserver: false,
+            commitHash: null,
+            revealedVote: null,
+            revealedSalt: null,
+            verified: null,
+            joinedAt: data.joinedAt || Date.now(),
+            connected: false,
+            isSelf: false
+          });
+        }
+
+        const existingConn = state.dataChannels.get(incomingPeerId);
+        if (existingConn && existingConn.open) return;
+
+        // Section 4.2.4: Deterministic Tie-Breaker (myPeerId > incomingPeerId dials)
+        if (state.myPeerId > incomingPeerId) {
+          if (state.peerInstance && !state.peerInstance.destroyed) {
+            const conn = state.peerInstance.connect(incomingPeerId, {
+              reliable: true,
+              serialization: 'json'
+            });
+            registerDataChannel(conn);
+          }
+        } else {
+          if (!existing || !existing._reannounced) {
+            const p = state.peers.get(incomingPeerId);
+            if (p) p._reannounced = true;
+            setTimeout(() => publishPresenceAnnouncement(), 120);
+          }
+        }
+
+        if (state.broadcastChannel) {
+          sendToPeer(incomingPeerId, buildSyncRoomStateMessage());
+          sendToPeer(incomingPeerId, buildSyncMeMessage());
+        }
+
+        renderRoomUI();
+      }
+
+      function registerDataChannel(conn) {
+        if (!conn || !conn.peer) return;
+        const remotePeerId = conn.peer;
+
+        state.dataChannels.set(remotePeerId, conn);
+
+        conn.on('open', () => {
+          state.dataChannels.set(remotePeerId, conn);
+          const p = state.peers.get(remotePeerId) || {
+            peerId: remotePeerId,
+            name: 'Peer',
+            isHost: state.hostPeerId === remotePeerId,
+            isObserver: false,
+            commitHash: null,
+            revealedVote: null,
+            revealedSalt: null,
+            verified: null,
+            joinedAt: Date.now()
+          };
+          p.connected = true;
+          state.peers.set(remotePeerId, p);
+
+          // Section 4.3: State Hydration on Connection Open
+          conn.send(buildSyncRoomStateMessage());
+          conn.send(buildSyncMeMessage());
+
+          if (state.isRevealed && state.myVote !== null && state.mySalt) {
+            conn.send({
+              type: 'VOTE_REVEALED',
+              payload: {
+                peerId: state.myPeerId,
+                value: state.myVote,
+                salt: state.mySalt
+              }
+            });
+          }
+
+          renderRoomUI();
+        });
+
+        conn.on('data', (msg) => {
+          handleIncomingMeshMessage(remotePeerId, msg);
+        });
+
+        const handleDisconnect = () => {
+          state.dataChannels.delete(remotePeerId);
+          handlePeerLeft(remotePeerId);
+        };
+
+        conn.on('close', handleDisconnect);
+        conn.on('error', handleDisconnect);
+      }
+
+      function handlePeerLeft(remotePeerId) {
+        if (!remotePeerId || remotePeerId === state.myPeerId) return;
+        state.peers.delete(remotePeerId);
+        state.dataChannels.delete(remotePeerId);
+
+        if (state.hostPeerId === remotePeerId) {
+          state.hostPeerId = null;
+        }
+        updateSelfInPeersMap();
+        renderRoomUI();
+      }
+
+      // -------------------------------------------------------------------
+      // 9. MESSAGE PROTOCOL HANDLER (Section 5.2)
+      // -------------------------------------------------------------------
+      async function handleIncomingMeshMessage(senderPeerId, msg) {
+        if (!msg || typeof msg !== 'object') return;
+
+        switch (msg.type) {
+          case 'SYNC_ROOM_STATE': {
+            const { hostPeerId, isRevealed, committedPeers } = msg.payload || {};
+            if (hostPeerId && !state.hostPeerId) {
+              state.hostPeerId = hostPeerId;
+            }
+            if (Array.isArray(committedPeers)) {
+              committedPeers.forEach((cid) => {
+                if (cid && cid !== state.myPeerId && state.peers.has(cid)) {
+                  const cp = state.peers.get(cid);
+                  if (!cp.commitHash) cp.commitHash = 'committed';
+                }
+              });
+            }
+            if (isRevealed && !state.isRevealed) {
+              state.isRevealed = true;
+              if (state.myVote !== null && state.mySalt) {
+                broadcastToMesh({
+                  type: 'VOTE_REVEALED',
+                  payload: {
+                    peerId: state.myPeerId,
+                    value: state.myVote,
+                    salt: state.mySalt
+                  }
+                });
+              }
+            }
+            updateSelfInPeersMap();
+            renderRoomUI();
+            break;
+          }
+
+          case 'SYNC_ME': {
+            const pData = msg.payload || {};
+            const peerId = pData.peerId || senderPeerId;
+            if (!peerId || peerId === state.myPeerId) return;
+
+            const existing = state.peers.get(peerId) || {};
+            const shouldReplySync = !existing._syncedBack;
+
+            const updatedPeer = {
+              ...existing,
+              peerId,
+              name: pData.name || existing.name || 'Peer',
+              isHost: Boolean(pData.isHost),
+              isObserver: Boolean(pData.isObserver),
+              commitHash: pData.commitHash ?? (existing.commitHash === 'committed' ? null : existing.commitHash) ?? null,
+              revealedVote: pData.revealedVote !== undefined ? normalizeFibValue(pData.revealedVote) : (existing.revealedVote ?? null),
+              revealedSalt: pData.revealedSalt ?? existing.revealedSalt ?? null,
+              joinedAt: pData.joinedAt || existing.joinedAt || Date.now(),
+              connected: true,
+              isSelf: false,
+              _syncedBack: true
+            };
+
+            if (pData.isHost) {
+              if (!state.hostPeerId || !state.peers.has(state.hostPeerId)) {
+                state.hostPeerId = peerId;
+              } else if (state.hostPeerId === state.myPeerId && state.myPeerId !== peerId) {
+                if ((pData.joinedAt || 0) < state.joinedAt ||
+                    ((pData.joinedAt || 0) === state.joinedAt && peerId < state.myPeerId)) {
+                  state.hostPeerId = peerId;
+                }
+              }
+            }
+
+            if (pData.isRevealed && !state.isRevealed) {
+              state.isRevealed = true;
+              if (state.myVote !== null && state.mySalt) {
+                sendToPeer(peerId, {
+                  type: 'VOTE_REVEALED',
+                  payload: {
+                    peerId: state.myPeerId,
+                    value: state.myVote,
+                    salt: state.mySalt
+                  }
+                });
+              }
+            }
+
+            if (updatedPeer.revealedVote !== null && updatedPeer.revealedSalt && updatedPeer.commitHash) {
+              const expected = await computeCommitHash(updatedPeer.revealedVote, updatedPeer.revealedSalt);
+              updatedPeer.verified = (expected === updatedPeer.commitHash);
+            }
+
+            state.peers.set(peerId, updatedPeer);
+            updateSelfInPeersMap();
+
+            if (shouldReplySync) {
+              sendToPeer(peerId, buildSyncRoomStateMessage());
+              sendToPeer(peerId, buildSyncMeMessage());
+            }
+
+            renderRoomUI();
+            break;
+          }
+
+          case 'VOTE_COMMITTED': {
+            if (state.isRevealed) return;
+            const { peerId, hash } = msg.payload || {};
+            const targetId = peerId || senderPeerId;
+            if (!targetId || targetId === state.myPeerId) return;
+
+            const peer = state.peers.get(targetId);
+            if (peer) {
+              peer.commitHash = hash || null;
+              peer.revealedVote = null;
+              peer.revealedSalt = null;
+              peer.verified = null;
+              state.peers.set(targetId, peer);
+              renderRoomUI();
+            }
+            break;
+          }
+
+          case 'TRIGGER_REVEAL': {
+            state.isRevealed = true;
+            updateSelfInPeersMap();
+
+            if (state.myVote !== null && state.mySalt) {
+              broadcastToMesh({
+                type: 'VOTE_REVEALED',
+                payload: {
+                  peerId: state.myPeerId,
+                  value: state.myVote,
+                  salt: state.mySalt
+                }
+              });
+            }
+            renderRoomUI();
+            break;
+          }
+
+          case 'VOTE_REVEALED': {
+            const { peerId, value, salt } = msg.payload || {};
+            const targetId = peerId || senderPeerId;
+            if (!targetId || targetId === state.myPeerId) return;
+
+            const peer = state.peers.get(targetId);
+            if (!peer) return;
+
+            const normalizedValue = normalizeFibValue(value);
+            if (normalizedValue === null || !salt) return;
+
+            const computedHash = await computeCommitHash(normalizedValue, salt);
+            if (peer.commitHash && peer.commitHash !== 'committed' && computedHash === peer.commitHash) {
+              peer.revealedVote = normalizedValue;
+              peer.revealedSalt = salt;
+              peer.verified = true;
+            } else if (!peer.commitHash || peer.commitHash === 'committed') {
+              peer.commitHash = computedHash;
+              peer.revealedVote = normalizedValue;
+              peer.revealedSalt = salt;
+              peer.verified = true;
+            } else {
+              peer.verified = false;
+            }
+            state.peers.set(targetId, peer);
+            renderRoomUI();
+            break;
+          }
+
+          case 'RESET_BOARD': {
+            resetBoardLocal();
+            break;
+          }
+
+          case 'SET_HOST': {
+            const newHostId = (msg.payload && (msg.payload.newHostId || msg.payload.hostId)) || msg.hostId;
+            if (!newHostId) return;
+            state.hostPeerId = newHostId;
+            state.peers.forEach((p, id) => {
+              p.isHost = (id === newHostId);
+            });
+            updateSelfInPeersMap();
+            renderRoomUI();
+            break;
+          }
+
+          case 'PEER_LEAVING': {
+            const leavingId = (msg.payload && msg.payload.peerId) || senderPeerId;
+            handlePeerLeft(leavingId);
+            break;
+          }
+        }
+      }
+
+      // -------------------------------------------------------------------
+      // 10. CEREMONY ACTIONS
+      // -------------------------------------------------------------------
+      async function selectCard(fibValue) {
+        if (state.isRevealed || state.myIsObserver) return;
+
+        if (state.myVote === fibValue) {
+          state.myVote = null;
+          state.mySalt = null;
+          state.myCommitHash = null;
+        } else {
+          state.myVote = fibValue;
+          state.mySalt = generateSaltHex();
+          state.myCommitHash = await computeCommitHash(fibValue, state.mySalt);
+        }
+
+        saveSessionVoteState();
+        updateSelfInPeersMap();
+
+        broadcastToMesh({
+          type: 'VOTE_COMMITTED',
+          payload: {
+            peerId: state.myPeerId,
+            hash: state.myCommitHash
+          }
+        });
+
+        renderRoomUI();
+      }
+
+      function triggerRevealCards() {
+        if (state.hostPeerId !== state.myPeerId) return;
+        state.isRevealed = true;
+        updateSelfInPeersMap();
+
+        broadcastToMesh({ type: 'TRIGGER_REVEAL' });
+
+        if (state.myVote !== null && state.mySalt) {
+          broadcastToMesh({
+            type: 'VOTE_REVEALED',
+            payload: {
+              peerId: state.myPeerId,
+              value: state.myVote,
+              salt: state.mySalt
+            }
+          });
+        }
+
+        renderRoomUI();
+      }
+
+      function resetBoardLocal() {
+        state.isRevealed = false;
+        state.confettiFiredForRound = false;
+        state.myVote = null;
+        state.mySalt = null;
+        state.myCommitHash = null;
+        saveSessionVoteState();
+
+        state.peers.forEach((p) => {
+          p.commitHash = null;
+          p.revealedVote = null;
+          p.revealedSalt = null;
+          p.verified = null;
+        });
+
+        updateSelfInPeersMap();
+        renderRoomUI();
+      }
+
+      function triggerResetBoard() {
+        if (state.hostPeerId !== state.myPeerId) return;
+        resetBoardLocal();
+        broadcastToMesh({ type: 'RESET_BOARD' });
+      }
+
+      function assignHostRole(targetPeerId) {
+        const isCurrentLead = state.hostPeerId === state.myPeerId;
+        const isLeadVacant = !state.hostPeerId || !state.peers.has(state.hostPeerId);
+        if (!isCurrentLead && !isLeadVacant) return;
+
+        state.hostPeerId = targetPeerId;
+        state.peers.forEach((p, id) => {
+          p.isHost = (id === targetPeerId);
+        });
+        updateSelfInPeersMap();
+
+        broadcastToMesh({
+          type: 'SET_HOST',
+          hostId: targetPeerId,
+          payload: {
+            newHostId: targetPeerId
+          }
+        });
+
+        renderRoomUI();
+      }
+
+      // -------------------------------------------------------------------
+      // 11. NETWORK LIFECYCLE
+      // -------------------------------------------------------------------
+      function teardownNetworking() {
+        if (state.announceTimer) {
+          clearInterval(state.announceTimer);
+          state.announceTimer = null;
+        }
+        if (state.hostElectionTimer) {
+          clearTimeout(state.hostElectionTimer);
+          state.hostElectionTimer = null;
+        }
+
+        if (state.myPeerId) {
+          broadcastToMesh({
+            type: 'PEER_LEAVING',
+            payload: { peerId: state.myPeerId }
+          });
+        }
+
+        state.dataChannels.forEach((conn) => {
+          try { conn.close(); } catch (_) {}
+        });
+        state.dataChannels.clear();
+
+        if (state.mqttClient) {
+          try { state.mqttClient.end(true); } catch (_) {}
+          state.mqttClient = null;
+        }
+
+        if (state.broadcastChannel) {
+          try { state.broadcastChannel.close(); } catch (_) {}
+          state.broadcastChannel = null;
+        }
+
+        if (state.peerInstance) {
+          try { state.peerInstance.destroy(); } catch (_) {}
+          state.peerInstance = null;
+        }
+
+        state.peers.clear();
+        state.myPeerId = '';
+        state.hostPeerId = null;
+      }
+
+      function startMeshForRoom() {
+        teardownNetworking();
+
+        const savedSession = loadSessionVoteState(state.roomName);
+        if (savedSession) {
+          state.joinedAt = savedSession.joinedAt || Date.now();
+          state.myVote = normalizeFibValue(savedSession.myVote);
+          state.mySalt = savedSession.mySalt || null;
+          state.myCommitHash = savedSession.myCommitHash || null;
+        } else {
+          state.joinedAt = Date.now();
+          state.myVote = null;
+          state.mySalt = null;
+          state.myCommitHash = null;
+        }
+
+        try {
+          state.broadcastChannel = new BroadcastChannel(`poker_room_${state.roomName}`);
+          state.broadcastChannel.onmessage = (ev) => {
+            const data = ev.data;
+            if (!data) return;
+            if (data.__bridge === 'DISCOVERY') {
+              handlePresenceAnnouncement(data.payload);
+            } else if (data.__bridge === 'DATA' && data.fromPeerId !== state.myPeerId) {
+              const dc = state.dataChannels.get(data.fromPeerId);
+              if (!dc || !dc.open) {
+                handleIncomingMeshMessage(data.fromPeerId, data.message);
+              }
+            } else if (data.__bridge === 'DATA_DIRECT' && data.toPeerId === state.myPeerId) {
+              const dc = state.dataChannels.get(data.fromPeerId);
+              if (!dc || !dc.open) {
+                handleIncomingMeshMessage(data.fromPeerId, data.message);
+              }
+            }
+          };
+        } catch (_) {}
+
+        const randomSuffix = Math.random().toString(36).substring(2, 8);
+        const requestedId = `peer-${randomSuffix}-${Date.now().toString(36).slice(-4)}`;
+
+        try {
+          const peer = new Peer(requestedId, {
+            host: '0.peerjs.com',
+            port: 443,
+            secure: true,
+            debug: 0,
+            config: {
+              iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' }
+              ]
+            }
+          });
+
+          state.peerInstance = peer;
+
+          peer.on('open', (id) => {
+            state.myPeerId = id;
+            onLocalPeerIdReady();
+          });
+
+          peer.on('connection', (conn) => {
+            registerDataChannel(conn);
+          });
+
+          peer.on('error', () => {
+            if (!state.myPeerId) {
+              state.myPeerId = requestedId;
+              onLocalPeerIdReady();
+            }
+          });
+        } catch (_) {
+          state.myPeerId = requestedId;
+          onLocalPeerIdReady();
+        }
+      }
+
+      function onLocalPeerIdReady() {
+        updateSelfInPeersMap();
+        renderRoomUI();
+
+        connectMqttDiscovery(0);
+        publishPresenceAnnouncement();
+
+        let announceCount = 0;
+        state.announceTimer = setInterval(() => {
+          announceCount++;
+          publishPresenceAnnouncement();
+          if (announceCount >= 6) {
+            clearInterval(state.announceTimer);
+            state.announceTimer = null;
+          }
+        }, 1200);
+
+        // First Joiner Default
+        state.hostElectionTimer = setTimeout(() => {
+          if (!state.hostPeerId) {
+            state.hostPeerId = state.myPeerId;
+            updateSelfInPeersMap();
+            broadcastToMesh(buildSyncMeMessage());
+            renderRoomUI();
+          }
+        }, 1400);
+      }
+
+      function connectMqttDiscovery(brokerIndex) {
+        if (!window.mqtt || !state.roomName) return;
+        const brokerUrl = MQTT_BROKERS[brokerIndex % MQTT_BROKERS.length];
+        const topic = getDiscoveryTopic();
+
+        try {
+          const client = window.mqtt.connect(brokerUrl, {
+            connectTimeout: 5000,
+            reconnectPeriod: 4000,
+            clean: true,
+            clientId: `pokr_${state.myPeerId || Math.random().toString(16).slice(2, 10)}`
+          });
+
+          state.mqttClient = client;
+
+          client.on('connect', () => {
+            if (!state.roomName) return;
+            client.subscribe(topic, { qos: 0 }, (err) => {
+              if (!err) publishPresenceAnnouncement();
+            });
+          });
+
+          client.on('message', (receivedTopic, payloadBuf) => {
+            if (receivedTopic !== topic) return;
+            try {
+              const parsed = JSON.parse(payloadBuf.toString());
+              handlePresenceAnnouncement(parsed);
+            } catch (_) {}
+          });
+
+          client.on('error', () => {
+            try { client.end(true); } catch (_) {}
+            if (brokerIndex + 1 < MQTT_BROKERS.length) {
+              connectMqttDiscovery(brokerIndex + 1);
+            }
+          });
+        } catch (_) {}
+      }
+
+      // -------------------------------------------------------------------
+      // 12. UI RENDERING
+      // -------------------------------------------------------------------
+      function renderDeckUI() {
+        if (state.myIsObserver) {
+          el.observerHandNotice.classList.remove('hidden');
+          el.fibonacciDeck.classList.add('hidden');
+          return;
+        }
+
+        el.observerHandNotice.classList.add('hidden');
+        el.fibonacciDeck.classList.remove('hidden');
+
+        el.fibonacciDeck.innerHTML = '';
+        FIB_DECK.forEach((val) => {
+          const isSelected = state.myVote === val;
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.disabled = state.isRevealed;
+          btn.className = [
+            'hand-card shrink-0 w-[52px] sm:w-14 aspect-[5/7] rounded-lg flex flex-col items-center justify-between p-1.5 border select-none focus:outline-none',
+            isSelected
+              ? 'selected bg-env-blue text-white border-env-lightblue'
+              : 'bg-[var(--bg-canvas)] text-[var(--text-primary)] border-[var(--border-subtle)] hover:border-env-blue dark:hover:border-env-lightblue',
+            state.isRevealed ? 'opacity-45 cursor-not-allowed' : 'cursor-pointer'
+          ].join(' ');
+
+          btn.innerHTML = `
+            <span class="font-mono text-[9px] self-start opacity-60 leading-none">${val}</span>
+            <span class="font-display font-bold text-lg sm:text-xl tracking-tight leading-none">${val}</span>
+            <span class="font-mono text-[9px] self-end opacity-60 leading-none rotate-180">${val}</span>
+          `;
+
+          btn.addEventListener('click', () => selectCard(val));
+          el.fibonacciDeck.appendChild(btn);
+        });
+      }
+
+      function renderDistributionUI(participants) {
+        if (!state.isRevealed) {
+          el.sectionDistribution.classList.add('hidden');
+          el.sectionDistribution.classList.remove('flex');
+          return;
+        }
+
+        const counts = new Map();
+        FIB_DECK.forEach(v => counts.set(v, 0));
+
+        let totalActiveNonNullVotes = 0;
+        let committedCount = 0;
+        let maxCount = 0;
+
+        participants.forEach((p) => {
+          if (p.isObserver) return;
+          if (p.commitHash) committedCount++;
+          if (p.revealedVote !== null && p.revealedVote !== undefined && counts.has(p.revealedVote)) {
+            const nextCount = counts.get(p.revealedVote) + 1;
+            counts.set(p.revealedVote, nextCount);
+            if (nextCount > maxCount) maxCount = nextCount;
+            totalActiveNonNullVotes++;
+          }
+        });
+
+        el.distributionBars.innerHTML = '';
+
+        if (totalActiveNonNullVotes === 0) {
+          el.sectionDistribution.classList.add('hidden');
+          el.sectionDistribution.classList.remove('flex');
+          return;
+        }
+
+        // Trigger bottom-middle confetti once per round when everyone who voted agrees on the same points
+        const distinctValues = Array.from(counts.values()).filter(c => c > 0).length;
+        if (
+          !state.confettiFiredForRound &&
+          committedCount > 0 &&
+          totalActiveNonNullVotes === committedCount &&
+          distinctValues === 1
+        ) {
+          state.confettiFiredForRound = true;
+          launchBottomMiddleConfetti();
+        }
+
+        el.sectionDistribution.classList.remove('hidden');
+        el.sectionDistribution.classList.add('flex');
+
+        FIB_DECK.forEach((cardVal) => {
+          const count = counts.get(cardVal) || 0;
+          if (count === 0) return;
+
+          const heightPct = Math.max(12, Math.round((count / maxCount) * 100));
+
+          const col = document.createElement('div');
+          col.className = 'flex flex-col items-center gap-2';
+          col.innerHTML = `
+            <div class="w-8 h-28 rounded-lg bg-[var(--bg-surface)]/80 border border-[var(--border-subtle)] p-1 flex items-end justify-center overflow-hidden">
+              <div class="dist-bar-fill w-full rounded-sm bg-env-blue dark:bg-env-lightblue" style="height: ${heightPct}%"></div>
+            </div>
+            <span class="font-display font-bold text-sm text-[var(--text-primary)] leading-none">${cardVal}</span>
+          `;
+          el.distributionBars.appendChild(col);
+        });
+      }
+
+      function renderSidebarItem(p, amIHost) {
+        const isLead = p.peerId === state.hostPeerId;
+        const li = document.createElement('li');
+        li.className = 'group flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg hover:bg-[var(--bg-canvas)] transition-colors';
+
+        let crownHtml = '';
+        if (isLead) {
+          crownHtml = `<span class="text-xs text-env-gold shrink-0" title="👑">👑</span>`;
+        } else if (amIHost && !p.isSelf) {
+          crownHtml = `
+            <button
+              type="button"
+              data-make-lead="${escapeHtml(p.peerId)}"
+              class="opacity-0 group-hover:opacity-45 hover:!opacity-100 focus:opacity-100 text-xs transition-opacity shrink-0"
+              title="Pass 👑"
+            >
+              👑
+            </button>
+          `;
+        }
+
+        li.innerHTML = `
+          <span class="truncate font-medium text-[var(--text-primary)]" title="${escapeHtml(p.name)}">
+            ${escapeHtml(p.name)}
+          </span>
+          ${crownHtml}
+        `;
+
+        const makeLeadBtn = li.querySelector('[data-make-lead]');
+        if (makeLeadBtn) {
+          makeLeadBtn.addEventListener('click', () => assignHostRole(p.peerId));
+        }
+
+        return li;
+      }
+
+      function renderRoomUI() {
+        if (!state.roomName) return;
+
+        const participants = Array.from(state.peers.values()).sort((a, b) => {
+          if (a.joinedAt !== b.joinedAt) return (a.joinedAt || 0) - (b.joinedAt || 0);
+          return String(a.peerId).localeCompare(String(b.peerId));
+        });
+
+        const hostParticipant = state.hostPeerId ? state.peers.get(state.hostPeerId) : null;
+        const isHostVacant = !hostParticipant;
+        const amIHost = state.hostPeerId === state.myPeerId;
+
+        el.headerMyName.textContent = state.myName;
+        if (isHostVacant) {
+          el.vacantLeadBanner.classList.remove('hidden');
+        } else {
+          el.vacantLeadBanner.classList.add('hidden');
+        }
+
+        if (amIHost) {
+          el.sectionHostControls.classList.remove('hidden');
+          el.sectionHostControls.classList.add('flex');
+          el.btnRevealCards.disabled = state.isRevealed;
+          el.btnResetBoard.disabled = false;
+        } else {
+          el.sectionHostControls.classList.add('hidden');
+          el.sectionHostControls.classList.remove('flex');
+        }
+
+        // Render Left Sidebar Lists: Voted, Waiting, Observer
+        el.sidebarListVoted.innerHTML = '';
+        el.sidebarListWaiting.innerHTML = '';
+        el.sidebarListObserver.innerHTML = '';
+
+        // Render Middle Area: Only participants who have voted
+        el.participantsGrid.innerHTML = '';
+
+        participants.forEach((p) => {
+          const hasCommitted = Boolean(p.commitHash);
+
+          if (p.isObserver) {
+            el.sidebarListObserver.appendChild(renderSidebarItem(p, amIHost));
+            return;
+          }
+
+          if (!hasCommitted) {
+            el.sidebarListWaiting.appendChild(renderSidebarItem(p, amIHost));
+            return;
+          }
+
+          // Participant has voted -> add to Voted sidebar list AND render card in middle area
+          el.sidebarListVoted.appendChild(renderSidebarItem(p, amIHost));
+
+          const isCardRevealed = state.isRevealed && p.revealedVote !== null && p.revealedVote !== undefined;
+          const seatEl = document.createElement('div');
+          seatEl.className = 'flex flex-col items-center w-24';
+
+          seatEl.innerHTML = `
+            <div class="w-16 h-24 card-perspective">
+              <div class="card-inner ${isCardRevealed ? 'is-flipped' : ''}">
+                <!-- Committed (Face-down) -->
+                <div class="card-face rounded-xl card-back-engraved border border-env-lightblue/60 shadow-sm flex items-center justify-center text-white">
+                  <span class="w-6 h-6 rounded-full bg-black/25 flex items-center justify-center text-xs font-mono">✔</span>
+                </div>
+                <!-- Revealed (Face-up) -->
+                <div class="card-face card-face-back rounded-xl bg-[var(--bg-surface)] border-2 border-env-blue dark:border-env-lightblue shadow-md flex flex-col items-center justify-between p-1.5">
+                  <span class="font-mono text-[9px] text-env-blue dark:text-env-lightblue self-start leading-none">${isCardRevealed ? p.revealedVote : ''}</span>
+                  <span class="font-display font-extrabold text-2xl leading-none">${isCardRevealed ? p.revealedVote : ''}</span>
+                  <span class="font-mono text-[9px] text-env-blue dark:text-env-lightblue self-end leading-none rotate-180">${isCardRevealed ? p.revealedVote : ''}</span>
+                </div>
+              </div>
+            </div>
+            <span class="mt-2 text-xs font-semibold truncate max-w-full" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</span>
+          `;
+
+          el.participantsGrid.appendChild(seatEl);
+        });
+
+        renderDeckUI();
+        renderDistributionUI(participants);
+      }
+
+      // -------------------------------------------------------------------
+      // 13. ROUTING & ONBOARDING (Sections 3.1 & 3.2)
+      // -------------------------------------------------------------------
+      function updateLobbyUrlPreview() {
+        const slug = sanitizeRoomName(el.inputRoomSlug.value) || 'core-sprint-44';
+        const base = window.location.href.split('#')[0];
+        el.lobbyUrlPreviewText.textContent = `${base}#${slug}`;
+      }
+
+      function handleRouteChange() {
+        const rawHash = window.location.hash.slice(1);
+        const sanitized = sanitizeRoomName(rawHash);
+
+        if (!sanitized) {
+          teardownNetworking();
+          state.roomName = '';
+          el.viewRoom.classList.add('hidden');
+          el.viewLobby.classList.remove('hidden');
+          el.headerRoomControls.classList.add('hidden');
+          el.headerRoomControls.classList.remove('flex');
+          el.btnEditProfile.classList.add('hidden');
+          el.btnEditProfile.classList.remove('inline-flex');
+          el.vacantLeadBanner.classList.add('hidden');
+          el.modalOnboarding.classList.add('hidden');
+          el.modalOnboarding.classList.remove('flex');
+
+          if (!el.inputRoomSlug.value) {
+            el.inputRoomSlug.value = generateRandomSlug();
+          }
+          updateLobbyUrlPreview();
+          return;
+        }
+
+        if (rawHash !== sanitized) {
+          history.replaceState(null, '', `#${sanitized}`);
+        }
+
+        state.roomName = sanitized;
+        el.viewLobby.classList.add('hidden');
+        el.viewRoom.classList.remove('hidden');
+        el.headerRoomControls.classList.remove('hidden');
+        el.headerRoomControls.classList.add('flex');
+        el.btnEditProfile.classList.remove('hidden');
+        el.btnEditProfile.classList.add('inline-flex');
+        el.headerRoomName.textContent = sanitized;
+
+        const savedSession = loadSessionVoteState(sanitized);
+        if (state.myName && savedSession && savedSession.onboarded) {
+          state.isOnboarded = true;
+          startMeshForRoom();
+        } else {
+          openOnboardingModal(false);
+        }
+      }
+
+      function openOnboardingModal(allowClose = false) {
+        el.modalRoomLabel.textContent = `#${state.roomName}`;
+        el.inputDisplayName.value = state.myName || '';
+        el.inputIsObserver.checked = Boolean(state.myIsObserver);
+        if (allowClose) {
+          el.btnCloseOnboarding.classList.remove('hidden');
+        } else {
+          el.btnCloseOnboarding.classList.add('hidden');
+        }
+        el.modalOnboarding.classList.remove('hidden');
+        el.modalOnboarding.classList.add('flex');
+        setTimeout(() => el.inputDisplayName.focus(), 50);
+      }
+
+      function closeOnboardingModal() {
+        el.modalOnboarding.classList.add('hidden');
+        el.modalOnboarding.classList.remove('flex');
+      }
+
+      async function copyTextToClipboard(text) {
+        try {
+          await navigator.clipboard.writeText(text);
+          return true;
+        } catch (_) {
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          try {
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+            return true;
+          } catch (_) {
+            document.body.removeChild(ta);
+            return false;
+          }
+        }
+      }
+
+      // -------------------------------------------------------------------
+      // 14. EVENT LISTENERS
+      // -------------------------------------------------------------------
+      function bindEvents() {
+        window.addEventListener('hashchange', handleRouteChange);
+
+        window.addEventListener('beforeunload', () => {
+          if (state.myPeerId) {
+            broadcastToMesh({
+              type: 'PEER_LEAVING',
+              payload: { peerId: state.myPeerId }
+            });
+          }
+        });
+
+        el.btnThemeToggle.addEventListener('click', toggleTheme);
+
+        el.inputRoomSlug.addEventListener('input', updateLobbyUrlPreview);
+
+        el.formCreateRoom.addEventListener('submit', (e) => {
+          e.preventDefault();
+          const slug = sanitizeRoomName(el.inputRoomSlug.value) || generateRandomSlug();
+          window.location.hash = `#${slug}`;
+        });
+
+        el.btnInstantRoom.addEventListener('click', () => {
+          const slug = generateRandomSlug();
+          el.inputRoomSlug.value = slug;
+          window.location.hash = `#${slug}`;
+        });
+
+        el.btnLobbyCopy.addEventListener('click', async () => {
+          const slug = sanitizeRoomName(el.inputRoomSlug.value) || generateRandomSlug();
+          el.inputRoomSlug.value = slug;
+          updateLobbyUrlPreview();
+          const fullUrl = `${window.location.href.split('#')[0]}#${slug}`;
+          await copyTextToClipboard(fullUrl);
+          el.lobbyCopyText.textContent = 'Copied';
+          setTimeout(() => {
+            el.lobbyCopyText.textContent = 'Copy Invite Link';
+          }, 1800);
+        });
+
+        el.btnCopyLink.addEventListener('click', async () => {
+          await copyTextToClipboard(window.location.href);
+          el.copyLinkText.textContent = 'Copied';
+          setTimeout(() => {
+            el.copyLinkText.textContent = 'Copy Link';
+          }, 1800);
+        });
+
+        el.formOnboarding.addEventListener('submit', (e) => {
+          e.preventDefault();
+          const name = el.inputDisplayName.value.trim() || 'Engineer';
+          const isObserver = el.inputIsObserver.checked;
+
+          state.myName = name;
+          state.myIsObserver = isObserver;
+          state.isOnboarded = true;
+
+          localStorage.setItem(STORAGE_KEYS.NAME, name);
+          localStorage.setItem(STORAGE_KEYS.OBSERVER, String(isObserver));
+
+          if (isObserver) {
+            state.myVote = null;
+            state.mySalt = null;
+            state.myCommitHash = null;
+          }
+
+          saveSessionVoteState();
+          closeOnboardingModal();
+
+          if (!state.peerInstance && !state.myPeerId) {
+            startMeshForRoom();
+          } else {
+            updateSelfInPeersMap();
+            broadcastToMesh(buildSyncMeMessage());
+            renderRoomUI();
+          }
+        });
+
+        el.btnCloseOnboarding.addEventListener('click', closeOnboardingModal);
+
+        el.btnEditProfile.addEventListener('click', () => {
+          openOnboardingModal(true);
+        });
+
+        el.btnSwitchToVoter.addEventListener('click', () => {
+          state.myIsObserver = false;
+          localStorage.setItem(STORAGE_KEYS.OBSERVER, 'false');
+          updateSelfInPeersMap();
+          broadcastToMesh(buildSyncMeMessage());
+          renderRoomUI();
+        });
+
+        el.btnRevealCards.addEventListener('click', triggerRevealCards);
+        el.btnResetBoard.addEventListener('click', triggerResetBoard);
+
+        el.btnClaimLead.addEventListener('click', () => {
+          if (state.myPeerId) {
+            assignHostRole(state.myPeerId);
+          }
+        });
+      }
+
+      initTheme();
+      bindEvents();
+      handleRouteChange();
+    })();
+  </script>
+</body>
+</html>
