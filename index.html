@@ -765,11 +765,10 @@
             }
           });
 
-          const roomPayload = {
+          const basePayload = {
             onboarded: state.isOnboarded,
             myName: state.myName,
             myIsObserver: state.myIsObserver,
-            wasLead: Boolean(state.myPeerId && state.hostPeerId === state.myPeerId),
             hostPeerId: state.hostPeerId,
             isRevealed: state.isRevealed,
             joinedAt: state.joinedAt,
@@ -780,9 +779,14 @@
             updatedAt: Date.now()
           };
 
-          const serialized = JSON.stringify(roomPayload);
-          localStorage.setItem(STORAGE_KEYS.ROOM_PREFIX + state.roomName, serialized);
-          sessionStorage.setItem(STORAGE_KEYS.SESSION_PREFIX + state.roomName, serialized);
+          localStorage.setItem(STORAGE_KEYS.ROOM_PREFIX + state.roomName, JSON.stringify(basePayload));
+          sessionStorage.setItem(
+            STORAGE_KEYS.SESSION_PREFIX + state.roomName,
+            JSON.stringify({
+              ...basePayload,
+              wasLead: Boolean(state.myPeerId && state.hostPeerId === state.myPeerId)
+            })
+          );
         } catch (_) {}
       }
 
@@ -797,6 +801,7 @@
           return {
             ...(localData || {}),
             ...(sessionData || {}),
+            wasLead: Boolean(sessionData && sessionData.wasLead),
             participants: (localData && Array.isArray(localData.participants))
               ? localData.participants
               : (sessionData && Array.isArray(sessionData.participants) ? sessionData.participants : [])
@@ -1037,14 +1042,18 @@
           renderRoomUI();
         }
 
-        if (state.peerInstance && !state.peerInstance.destroyed && state.peerInstance.open) {
-          try {
-            const conn = state.peerInstance.connect(leadId, {
-              reliable: true,
-              serialization: 'json'
-            });
-            registerDataChannel(conn, true);
-          } catch (_) {}
+        if (state.peerInstance && !state.peerInstance.destroyed) {
+          if (state.peerInstance.disconnected) {
+            try { state.peerInstance.reconnect(); } catch (_) {}
+          } else if (state.peerInstance.open) {
+            try {
+              const conn = state.peerInstance.connect(leadId, {
+                reliable: true,
+                serialization: 'json'
+              });
+              registerDataChannel(conn, true);
+            } catch (_) {}
+          }
         }
 
         state.leadProbeTimeout = setTimeout(() => {
@@ -1126,7 +1135,26 @@
         const remotePeerId = conn.peer;
         conn._createdAt = Date.now();
 
+        const prevConn = state.dataChannels.get(remotePeerId);
+        if (prevConn && prevConn !== conn && !prevConn.open) {
+          try { prevConn.close(); } catch (_) {}
+        }
         state.dataChannels.set(remotePeerId, conn);
+
+        setTimeout(() => {
+          const pc = conn.peerConnection;
+          if (pc && typeof pc.addEventListener === 'function') {
+            pc.addEventListener('iceconnectionstatechange', () => {
+              if (pc.iceConnectionState === 'failed') {
+                if (state.dataChannels.get(remotePeerId) === conn) {
+                  state.dataChannels.delete(remotePeerId);
+                  try { conn.close(); } catch (_) {}
+                  handlePeerLeft(remotePeerId);
+                }
+              }
+            });
+          }
+        }, 50);
 
         conn.on('open', () => {
           state.dataChannels.set(remotePeerId, conn);
@@ -1683,13 +1711,7 @@
             host: '0.peerjs.com',
             port: 443,
             secure: true,
-            debug: 0,
-            config: {
-              iceServers: [
-                { urls: 'stun:stun.l.google.com:19302' },
-                { urls: 'stun:stun1.l.google.com:19302' }
-              ]
-            }
+            debug: 0
           });
 
           state.peerInstance = peer;
@@ -1797,6 +1819,7 @@
         teardownNetworking();
 
         const savedRoom = loadRoomState(state.roomName);
+        const leadId = getLeadPeerId(state.roomName);
         const cachedRemotePeers = [];
         if (savedRoom) {
           state.joinedAt = savedRoom.joinedAt || Date.now();
@@ -1810,20 +1833,7 @@
           if (Array.isArray(savedRoom.participants)) {
             savedRoom.participants.forEach((p) => {
               const pid = p && (p.peerId || p.id);
-              if (pid) {
-                state.peers.set(pid, {
-                  peerId: pid,
-                  name: p.name || 'Peer',
-                  isHost: Boolean(p.isHost),
-                  isObserver: Boolean(p.isObserver),
-                  commitHash: p.commitHash || null,
-                  revealedVote: normalizeFibValue(p.revealedVote),
-                  revealedSalt: p.revealedSalt || null,
-                  verified: p.verified ?? null,
-                  joinedAt: p.joinedAt || Date.now(),
-                  connected: false,
-                  isSelf: false
-                });
+              if (pid && pid !== leadId) {
                 cachedRemotePeers.push({ id: pid, name: p.name || 'Peer' });
               }
             });
@@ -1838,7 +1848,6 @@
 
         // If this tab was previously the Lead before a page refresh, re-bind as LEAD_PEER_ID
         if (savedRoom && savedRoom.wasLead) {
-          const leadId = getLeadPeerId(state.roomName);
           state.myPeerId = leadId;
           state.hostPeerId = leadId;
           updateSelfInPeersMap();
