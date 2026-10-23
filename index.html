@@ -810,6 +810,23 @@
       // -------------------------------------------------------------------
       // 7. STATE & MESH TRANSPORT (Sections 4 & 5)
       // -------------------------------------------------------------------
+      window.__pokrState = state;
+
+      function logDebug(event, details = {}) {
+        const ts = new Date().toISOString().slice(11, 23);
+        const roleTag = state.hostPeerId && state.hostPeerId === state.myPeerId ? '👑HOST' : 'MEMBER';
+        console.log(
+          `%c[Pokr ${ts}] [${ state.myName || 'Anon' } | ${ state.myPeerId || 'no-id' } | ${roleTag}] ${event}`,
+          'color: #0074bd; font-weight: 600;',
+          details
+        );
+      }
+
+      function logWarn(event, details = {}) {
+        const ts = new Date().toISOString().slice(11, 23);
+        console.warn(`[Pokr ${ts}] [${ state.myName || 'Anon' } | ${ state.myPeerId || 'no-id' }] ${event}`, details);
+      }
+
       function getLeadPeerId(room = state.roomName) {
         return toValidPeerId(`${room}__lead`);
       }
@@ -873,46 +890,44 @@
       }
 
       function broadcastToMesh(message) {
-        state.dataChannels.forEach((conn) => {
+        const sentTo = [];
+        state.dataChannels.forEach((conn, peerId) => {
           if (conn && conn.open) {
-            try { conn.send(message); } catch (_) {}
+            try {
+              conn.send(message);
+              sentTo.push(peerId);
+            } catch (err) {
+              logWarn(`Failed broadcast send to ${peerId}`, err);
+            }
           }
         });
-        if (state.broadcastChannel && state.myPeerId) {
-          try {
-            state.broadcastChannel.postMessage({
-              __bridge: 'BROADCAST',
-              fromPeerId: state.myPeerId,
-              message
-            });
-          } catch (_) {}
-        }
+        logDebug(`TX Broadcast [${message.type}]`, { sentTo, message });
       }
 
       function sendToPeer(peerId, message) {
         if (!peerId || peerId === state.myPeerId) return;
         const conn = state.dataChannels.get(peerId);
-        if (conn) {
-          if (conn.open) {
+        if (!conn) {
+          logWarn(`TX Direct [${message.type}] skipped — no DataChannel in map for ${peerId}`, { message });
+          return;
+        }
+        if (conn.open) {
+          try {
+            conn.send(message);
+            logDebug(`TX Direct -> ${peerId} [${message.type}]`, message);
+          } catch (err) {
+            logWarn(`TX Direct -> ${peerId} [${message.type}] failed`, err);
+          }
+        } else if (typeof conn.once === 'function') {
+          logDebug(`TX Direct -> ${peerId} [${message.type}] queued until DataChannel opens`, message);
+          conn.once('open', () => {
             try {
               conn.send(message);
-              return;
-            } catch (_) {}
-          } else if (typeof conn.once === 'function') {
-            conn.once('open', () => {
-              try { conn.send(message); } catch (_) {}
-            });
-          }
-        }
-        if (state.broadcastChannel && state.myPeerId) {
-          try {
-            state.broadcastChannel.postMessage({
-              __bridge: 'DIRECT',
-              fromPeerId: state.myPeerId,
-              toPeerId: peerId,
-              message
-            });
-          } catch (_) {}
+              logDebug(`TX Direct (flushed queue) -> ${peerId} [${message.type}]`, message);
+            } catch (err) {
+              logWarn(`TX Direct (flushed queue) -> ${peerId} failed`, err);
+            }
+          });
         }
       }
 
@@ -933,6 +948,7 @@
       function ensureLeadPolling() {
         if (!state.roomName || state.hostPeerId) return;
         if (state.leadPollTimer) return;
+        logDebug('Starting 2s background poll for LEAD_PEER_ID', { leadId: getLeadPeerId() });
         state.leadPollTimer = setInterval(() => {
           if (state.hostPeerId && state.peers.has(state.hostPeerId)) {
             clearLeadProbeTimers();
@@ -967,6 +983,7 @@
           isSelf: false
         };
         state.peers.set(peerId, entry);
+        logDebug(`Added peer to local roster: ${peerId} (${entry.name})`);
         return entry;
       }
 
@@ -976,23 +993,44 @@
         ensurePeerEntry(targetPeerId, targetName);
 
         const existingConn = state.dataChannels.get(targetPeerId);
-        if (existingConn && existingConn.open) return;
+        if (existingConn) {
+          if (existingConn.open) {
+            logDebug(`Mesh connection to ${targetPeerId} already open`);
+            return;
+          }
+          const ageMs = Date.now() - (existingConn._createdAt || 0);
+          if (ageMs < 8000) {
+            logDebug(`Mesh connection to ${targetPeerId} already negotiating ICE (${ageMs}ms elapsed), waiting...`);
+            return;
+          }
+          logWarn(`Mesh connection to ${targetPeerId} timed out after ${ageMs}ms, replacing`);
+          try { existingConn.close(); } catch (_) {}
+          state.dataChannels.delete(targetPeerId);
+        }
 
-        if (forceConnect || state.myPeerId > targetPeerId) {
+        const shouldDial = forceConnect || (state.myPeerId > targetPeerId);
+        logDebug(`Tie-breaker check for ${targetPeerId}`, {
+          myPeerId: state.myPeerId,
+          targetPeerId,
+          forceConnect,
+          shouldDial
+        });
+
+        if (shouldDial) {
           if (state.peerInstance && !state.peerInstance.destroyed && state.peerInstance.open) {
             try {
+              logDebug(`Dialing peer ${targetPeerId}...`);
               const conn = state.peerInstance.connect(targetPeerId, {
                 reliable: true,
                 serialization: 'json'
               });
-              registerDataChannel(conn);
-            } catch (_) {}
+              registerDataChannel(conn, false);
+            } catch (err) {
+              logWarn(`Failed dialing peer ${targetPeerId}`, err);
+            }
+          } else {
+            logWarn(`Cannot dial ${targetPeerId} — local PeerJS instance not open yet`);
           }
-        }
-
-        if (state.broadcastChannel) {
-          sendToPeer(targetPeerId, buildSyncRoomStateMessage());
-          sendToPeer(targetPeerId, buildSyncMeMessage());
         }
       }
 
@@ -1004,7 +1042,20 @@
         if (state.hostPeerId && state.peers.has(state.hostPeerId)) return;
 
         const existingLeadConn = state.dataChannels.get(leadId);
-        if (existingLeadConn && existingLeadConn.open) return;
+        if (existingLeadConn) {
+          if (existingLeadConn.open) {
+            logDebug(`Probe skipped — already connected to lead ${leadId}`);
+            return;
+          }
+          const ageMs = Date.now() - (existingLeadConn._createdAt || 0);
+          if (ageMs < 8000) {
+            logDebug(`Probe to lead ${leadId} still negotiating WebRTC ICE (${ageMs}ms elapsed), waiting...`);
+            return;
+          }
+          logWarn(`Previous probe to lead ${leadId} timed out after ${ageMs}ms, cleaning up before retry`);
+          try { existingLeadConn.close(); } catch (_) {}
+          state.dataChannels.delete(leadId);
+        }
 
         if (state.leadProbeTimeout) {
           clearTimeout(state.leadProbeTimeout);
@@ -1016,48 +1067,37 @@
           renderRoomUI();
         }
 
-        // Also probe over BroadcastChannel for instant local multi-tab discovery when a lead is bound
-        if (state.broadcastChannel && state.myPeerId) {
-          try {
-            state.broadcastChannel.postMessage({
-              __bridge: 'DIRECT',
-              fromPeerId: state.myPeerId,
-              toPeerId: leadId,
-              message: {
-                type: 'JOIN_REQUEST',
-                payload: {
-                  peerId: state.myPeerId,
-                  name: state.myName || 'Anonymous'
-                }
-              }
-            });
-          } catch (_) {}
-        }
-
         if (state.peerInstance && !state.peerInstance.destroyed && state.peerInstance.open) {
           try {
+            logDebug(`Probing LEAD_PEER_ID: ${leadId} (backgroundPoll=${isBackgroundPoll})`);
             const conn = state.peerInstance.connect(leadId, {
               reliable: true,
               serialization: 'json'
             });
             registerDataChannel(conn, true);
-          } catch (_) {}
+          } catch (err) {
+            logWarn(`Exception probing LEAD_PEER_ID ${leadId}`, err);
+          }
+        } else {
+          logWarn(`Probe skipped — PeerJS instance not open yet`);
         }
 
         state.leadProbeTimeout = setTimeout(() => {
           const activeConn = state.dataChannels.get(leadId);
           if ((!activeConn || !activeConn.open) && !state.hostPeerId) {
+            logDebug(`Probe window elapsed without open connection yet; surfacing Claim/Wait UI while continuing poll`);
             state.isProbingLead = false;
             ensureLeadPolling();
             renderRoomUI();
           }
-        }, 2200);
+        }, 2500);
       }
 
       // Prompt Choice 1: Claim 👑 -> Re-initialize PeerJS binding explicitly to LEAD_PEER_ID
       function claimLeadByBinding() {
         if (!state.roomName) return;
         const leadId = getLeadPeerId();
+        logDebug(`User clicked Claim 👑 — target LEAD_PEER_ID: ${leadId}`);
 
         // If already bound as LEAD_PEER_ID, just claim host state
         if (state.myPeerId === leadId) {
@@ -1110,6 +1150,7 @@
       // Prompt Choice 2: Wait -> Retries polling LEAD_PEER_ID at 2-second intervals
       function startWaitingForLead() {
         if (!state.roomName || state.hostPeerId) return;
+        logDebug('User clicked Wait — polling LEAD_PEER_ID every 2s');
         state.isWaitingForLead = true;
         state.isProbingLead = false;
         renderRoomUI();
@@ -1121,14 +1162,30 @@
       function registerDataChannel(conn, isLeadProbe = false) {
         if (!conn || !conn.peer) return;
         const remotePeerId = conn.peer;
+        conn._createdAt = Date.now();
 
-        const prevConn = state.dataChannels.get(remotePeerId);
-        if (prevConn && prevConn !== conn && !prevConn.open) {
-          try { prevConn.close(); } catch (_) {}
-        }
+        logDebug(`Registering DataChannel with ${remotePeerId} (isLeadProbe=${isLeadProbe})`);
         state.dataChannels.set(remotePeerId, conn);
 
+        // Monitor underlying RTCPeerConnection ICE state for debugging
+        setTimeout(() => {
+          const pc = conn.peerConnection;
+          if (pc) {
+            logDebug(`RTCPeerConnection created for ${remotePeerId}`, {
+              iceConnectionState: pc.iceConnectionState,
+              signalingState: pc.signalingState
+            });
+            pc.addEventListener('iceconnectionstatechange', () => {
+              logDebug(`ICE state change with ${remotePeerId}: ${pc.iceConnectionState}`, {
+                iceGatheringState: pc.iceGatheringState,
+                signalingState: pc.signalingState
+              });
+            });
+          }
+        }, 50);
+
         conn.on('open', () => {
+          logDebug(`DataChannel OPEN with ${remotePeerId}`);
           state.dataChannels.set(remotePeerId, conn);
 
           if (remotePeerId === getLeadPeerId()) {
@@ -1149,18 +1206,23 @@
 
           // Section 4.3 Step 1: Transmit JOIN_REQUEST when connecting to Lead
           if (isLeadProbe || remotePeerId === getLeadPeerId()) {
-            conn.send({
+            const joinReq = {
               type: 'JOIN_REQUEST',
               payload: {
                 peerId: state.myPeerId,
                 name: state.myName || 'Anonymous'
               }
-            });
+            };
+            logDebug(`TX Direct -> ${remotePeerId} [JOIN_REQUEST]`, joinReq);
+            conn.send(joinReq);
           }
 
           // Exchange state hydration on DataChannel open
-          conn.send(buildSyncRoomStateMessage());
-          conn.send(buildSyncMeMessage());
+          const roomStateMsg = buildSyncRoomStateMessage();
+          const syncMeMsg = buildSyncMeMessage();
+          logDebug(`TX Direct -> ${remotePeerId} [SYNC_ROOM_STATE + SYNC_ME]`, { roomStateMsg, syncMeMsg });
+          conn.send(roomStateMsg);
+          conn.send(syncMeMsg);
 
           if (state.isRevealed && state.myVote !== null && state.mySalt) {
             conn.send({
@@ -1177,26 +1239,35 @@
         });
 
         conn.on('data', (msg) => {
+          logDebug(`RX <- ${remotePeerId} [${msg && msg.type}]`, msg);
           handleIncomingMeshMessage(remotePeerId, msg);
         });
 
-        const handleDisconnect = () => {
+        conn.on('close', () => {
+          logWarn(`DataChannel CLOSED with ${remotePeerId}`);
           if (state.dataChannels.get(remotePeerId) === conn) {
             state.dataChannels.delete(remotePeerId);
             handlePeerLeft(remotePeerId);
           }
-        };
+        });
 
-        conn.on('close', handleDisconnect);
-        conn.on('error', handleDisconnect);
+        conn.on('error', (err) => {
+          logWarn(`DataChannel ERROR with ${remotePeerId}`, err);
+          if (state.dataChannels.get(remotePeerId) === conn) {
+            state.dataChannels.delete(remotePeerId);
+            handlePeerLeft(remotePeerId);
+          }
+        });
       }
 
       function handlePeerLeft(remotePeerId) {
         if (!remotePeerId || remotePeerId === state.myPeerId) return;
+        logWarn(`Peer left room: ${remotePeerId}`);
         state.peers.delete(remotePeerId);
         state.dataChannels.delete(remotePeerId);
 
         if (state.hostPeerId === remotePeerId) {
+          logWarn(`Host ${remotePeerId} disconnected — host role is now vacant`);
           state.hostPeerId = null;
           ensureLeadPolling();
         }
@@ -1261,19 +1332,13 @@
             state.dataChannels.forEach((conn, peerId) => {
               if (peerId !== joinerId && conn && conn.open) {
                 try {
+                  logDebug(`TX Direct -> ${peerId} [PEER_ANNOUNCE]`, announceMsg);
                   conn.send(announceMsg);
-                } catch (_) {}
+                } catch (err) {
+                  logWarn(`Failed sending PEER_ANNOUNCE to ${peerId}`, err);
+                }
               }
             });
-            if (state.broadcastChannel && state.myPeerId) {
-              try {
-                state.broadcastChannel.postMessage({
-                  __bridge: 'BROADCAST',
-                  fromPeerId: state.myPeerId,
-                  message: announceMsg
-                });
-              } catch (_) {}
-            }
 
             renderRoomUI();
             break;
@@ -1299,7 +1364,9 @@
                 const pname = (peerInfo && peerInfo.name) || 'Peer';
                 if (pid && pid !== state.myPeerId) {
                   ensurePeerEntry(pid, pname);
-                  connectToPeerWithTieBreaker(pid, pname);
+                  if (pid !== senderPeerId) {
+                    connectToPeerWithTieBreaker(pid, pname);
+                  }
                 }
               });
             }
@@ -1659,11 +1726,6 @@
         });
         state.dataChannels.clear();
 
-        if (state.broadcastChannel) {
-          try { state.broadcastChannel.close(); } catch (_) {}
-          state.broadcastChannel = null;
-        }
-
         if (state.peerInstance) {
           try { state.peerInstance.destroy(); } catch (_) {}
           state.peerInstance = null;
@@ -1675,12 +1737,20 @@
       }
 
       function initPeerInstance(requestedId, isClaimingLead = false, reconnectPeers = []) {
+        logDebug(`Initializing PeerJS instance`, {
+          requestedId,
+          roomName: state.roomName,
+          leadPeerId: getLeadPeerId(),
+          isClaimingLead,
+          reconnectPeers
+        });
+
         try {
           const peer = new Peer(requestedId, {
             host: '0.peerjs.com',
             port: 443,
             secure: true,
-            debug: 0,
+            debug: 2,
             config: {
               iceServers: [
                 { urls: 'stun:stun.l.google.com:19302' },
@@ -1696,14 +1766,17 @@
             if (isClaimingLead) {
               state.hostPeerId = id;
             }
+            logDebug(`PeerJS signaling WebSocket OPEN on 0.peerjs.com`, {
+              boundPeerId: id,
+              hostPeerId: state.hostPeerId,
+              isClaimingLead
+            });
+
             updateSelfInPeersMap();
             saveSessionVoteState();
             renderRoomUI();
 
             if (isClaimingLead) {
-              // Notify any local tabs waiting on BroadcastChannel and reconnect known peers
-              broadcastToMesh(buildSyncRoomStateMessage());
-              broadcastToMesh(buildSyncMeMessage());
               reconnectPeers.forEach((p) => {
                 connectToPeerWithTieBreaker(p.id, p.name, true);
               });
@@ -1714,10 +1787,26 @@
           });
 
           peer.on('connection', (conn) => {
+            logDebug(`Incoming PeerJS DataConnection from ${conn && conn.peer}`);
             registerDataChannel(conn, false);
           });
 
+          peer.on('disconnected', () => {
+            logWarn(`PeerJS signaling WebSocket disconnected from 0.peerjs.com — attempting reconnect...`);
+            try {
+              if (!peer.destroyed) peer.reconnect();
+            } catch (err) {
+              logWarn(`PeerJS reconnect failed`, err);
+            }
+          });
+
+          peer.on('close', () => {
+            logWarn(`PeerJS instance closed (${requestedId})`);
+          });
+
           peer.on('error', (err) => {
+            logWarn(`PeerJS error event [type=${err && err.type}]: ${err && err.message}`, err);
+
             // When probing LEAD_PEER_ID and no lead exists on 0.peerjs.com,
             // PeerJS emits 'peer-unavailable'. Immediately surface Claim / Wait choice
             // and start background 2s polling so when someone claims 👑, we connect automatically.
@@ -1741,6 +1830,7 @@
             // If claiming LEAD_PEER_ID failed because another peer just claimed it,
             // fall back to an ephemeral member ID and connect to the lead.
             if (isClaimingLead && err && err.type === 'unavailable-id') {
+              logWarn(`LEAD_PEER_ID (${requestedId}) is already taken on 0.peerjs.com — falling back to member ID and probing lead`);
               try { peer.destroy(); } catch (_) {}
               state.peerInstance = null;
               state.peers.delete(state.myPeerId);
@@ -1761,7 +1851,8 @@
               renderRoomUI();
             }
           });
-        } catch (_) {
+        } catch (err) {
+          logWarn(`Exception creating PeerJS instance`, err);
           state.myPeerId = requestedId;
           state.isProbingLead = false;
           ensureLeadPolling();
@@ -1786,29 +1877,10 @@
           state.myCommitHash = null;
         }
 
-        // Local BroadcastChannel bridge for same-browser multi-tab testing
-        try {
-          state.broadcastChannel = new BroadcastChannel(`poker_room_${state.roomName}`);
-          state.broadcastChannel.onmessage = (ev) => {
-            const data = ev.data;
-            if (!data || !data.fromPeerId || data.fromPeerId === state.myPeerId) return;
-            if (data.__bridge === 'DIRECT' && data.toPeerId === state.myPeerId) {
-              const dc = state.dataChannels.get(data.fromPeerId);
-              if (!dc || !dc.open || data.message?.type === 'JOIN_REQUEST' || data.message?.type === 'ROSTER_SYNC') {
-                handleIncomingMeshMessage(data.fromPeerId, data.message);
-              }
-            } else if (data.__bridge === 'BROADCAST') {
-              const dc = state.dataChannels.get(data.fromPeerId);
-              if (!dc || !dc.open) {
-                handleIncomingMeshMessage(data.fromPeerId, data.message);
-              }
-            }
-          };
-        } catch (_) {}
-
         // If this tab was previously the Lead before a page refresh, re-bind as LEAD_PEER_ID
         if (savedSession && savedSession.wasLead) {
           const leadId = getLeadPeerId(state.roomName);
+          logDebug(`Restoring previous Lead session for room #${state.roomName}`, { leadId });
           state.myPeerId = leadId;
           state.hostPeerId = leadId;
           updateSelfInPeersMap();
@@ -1819,6 +1891,7 @@
 
         // Section 4.2: Ephemeral Member Peer ID on initial join
         const memberPeerId = generateMemberPeerId(state.roomName);
+        logDebug(`Starting mesh as Member for room #${state.roomName}`, { memberPeerId, targetLeadId: getLeadPeerId(state.roomName) });
         state.myPeerId = memberPeerId;
         updateSelfInPeersMap();
         renderRoomUI();
