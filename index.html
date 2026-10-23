@@ -1131,9 +1131,11 @@
       }
 
       function registerDataChannel(conn, isLeadProbe = false) {
-        if (!conn || !conn.peer) return;
-        const remotePeerId = conn.peer;
+        if (!conn) return;
         conn._createdAt = Date.now();
+        if (!conn.peer) return;
+
+        const remotePeerId = conn.peer;
 
         const prevConn = state.dataChannels.get(remotePeerId);
         if (prevConn && prevConn !== conn && !prevConn.open) {
