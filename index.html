@@ -501,7 +501,7 @@
       const STORAGE_KEYS = {
         THEME: 'pokr_theme',
         NAME: 'pokr_display_name',
-        OBSERVER: 'pokr_is_observer',
+        ROOM_PREFIX: 'pokr_room_',
         SESSION_PREFIX: 'pokr_session_'
       };
 
@@ -512,7 +512,7 @@
         roomName: '',
         myPeerId: '',
         myName: localStorage.getItem(STORAGE_KEYS.NAME) || '',
-        myIsObserver: localStorage.getItem(STORAGE_KEYS.OBSERVER) === 'true',
+        myIsObserver: false,
         joinedAt: Date.now(),
 
         hostPeerId: null,
@@ -533,7 +533,6 @@
 
         peerInstance: null,
         dataChannels: new Map(),
-        broadcastChannel: null,
         isOnboarded: false
       };
 
@@ -746,29 +745,62 @@
         return `${pick}-sprint-${num}`;
       }
 
-      function saveSessionVoteState() {
+      function saveRoomState() {
         if (!state.roomName) return;
         try {
-          sessionStorage.setItem(
-            STORAGE_KEYS.SESSION_PREFIX + state.roomName,
-            JSON.stringify({
-              onboarded: state.isOnboarded,
-              myName: state.myName,
-              myIsObserver: state.myIsObserver,
-              wasLead: Boolean(state.myPeerId && state.hostPeerId === state.myPeerId),
-              joinedAt: state.joinedAt,
-              myVote: state.myVote,
-              mySalt: state.mySalt,
-              myCommitHash: state.myCommitHash
-            })
-          );
+          const participants = [];
+          state.peers.forEach((p, id) => {
+            if (id && id !== state.myPeerId) {
+              participants.push({
+                peerId: id,
+                name: p.name || 'Peer',
+                isHost: Boolean(p.isHost),
+                isObserver: Boolean(p.isObserver),
+                commitHash: p.commitHash || null,
+                revealedVote: p.revealedVote ?? null,
+                revealedSalt: p.revealedSalt || null,
+                verified: p.verified ?? null,
+                joinedAt: p.joinedAt || Date.now()
+              });
+            }
+          });
+
+          const roomPayload = {
+            onboarded: state.isOnboarded,
+            myName: state.myName,
+            myIsObserver: state.myIsObserver,
+            wasLead: Boolean(state.myPeerId && state.hostPeerId === state.myPeerId),
+            hostPeerId: state.hostPeerId,
+            isRevealed: state.isRevealed,
+            joinedAt: state.joinedAt,
+            myVote: state.myVote,
+            mySalt: state.mySalt,
+            myCommitHash: state.myCommitHash,
+            participants,
+            updatedAt: Date.now()
+          };
+
+          const serialized = JSON.stringify(roomPayload);
+          localStorage.setItem(STORAGE_KEYS.ROOM_PREFIX + state.roomName, serialized);
+          sessionStorage.setItem(STORAGE_KEYS.SESSION_PREFIX + state.roomName, serialized);
         } catch (_) {}
       }
 
-      function loadSessionVoteState(roomName) {
+      function loadRoomState(roomName) {
+        if (!roomName) return null;
         try {
-          const raw = sessionStorage.getItem(STORAGE_KEYS.SESSION_PREFIX + roomName);
-          return raw ? JSON.parse(raw) : null;
+          const rawSession = sessionStorage.getItem(STORAGE_KEYS.SESSION_PREFIX + roomName);
+          const rawLocal = localStorage.getItem(STORAGE_KEYS.ROOM_PREFIX + roomName);
+          const localData = rawLocal ? JSON.parse(rawLocal) : null;
+          const sessionData = rawSession ? JSON.parse(rawSession) : null;
+          if (!localData && !sessionData) return null;
+          return {
+            ...(localData || {}),
+            ...(sessionData || {}),
+            participants: (localData && Array.isArray(localData.participants))
+              ? localData.participants
+              : (sessionData && Array.isArray(sessionData.participants) ? sessionData.participants : [])
+          };
         } catch (_) {
           return null;
         }
@@ -810,23 +842,6 @@
       // -------------------------------------------------------------------
       // 7. STATE & MESH TRANSPORT (Sections 4 & 5)
       // -------------------------------------------------------------------
-      window.__pokrState = state;
-
-      function logDebug(event, details = {}) {
-        const ts = new Date().toISOString().slice(11, 23);
-        const roleTag = state.hostPeerId && state.hostPeerId === state.myPeerId ? '👑HOST' : 'MEMBER';
-        console.log(
-          `%c[Pokr ${ts}] [${ state.myName || 'Anon' } | ${ state.myPeerId || 'no-id' } | ${roleTag}] ${event}`,
-          'color: #0074bd; font-weight: 600;',
-          details
-        );
-      }
-
-      function logWarn(event, details = {}) {
-        const ts = new Date().toISOString().slice(11, 23);
-        console.warn(`[Pokr ${ts}] [${ state.myName || 'Anon' } | ${ state.myPeerId || 'no-id' }] ${event}`, details);
-      }
-
       function getLeadPeerId(room = state.roomName) {
         return toValidPeerId(`${room}__lead`);
       }
@@ -890,43 +905,28 @@
       }
 
       function broadcastToMesh(message) {
-        const sentTo = [];
-        state.dataChannels.forEach((conn, peerId) => {
+        state.dataChannels.forEach((conn) => {
           if (conn && conn.open) {
             try {
               conn.send(message);
-              sentTo.push(peerId);
-            } catch (err) {
-              logWarn(`Failed broadcast send to ${peerId}`, err);
-            }
+            } catch (_) {}
           }
         });
-        logDebug(`TX Broadcast [${message.type}]`, { sentTo, message });
       }
 
       function sendToPeer(peerId, message) {
         if (!peerId || peerId === state.myPeerId) return;
         const conn = state.dataChannels.get(peerId);
-        if (!conn) {
-          logWarn(`TX Direct [${message.type}] skipped — no DataChannel in map for ${peerId}`, { message });
-          return;
-        }
+        if (!conn) return;
         if (conn.open) {
           try {
             conn.send(message);
-            logDebug(`TX Direct -> ${peerId} [${message.type}]`, message);
-          } catch (err) {
-            logWarn(`TX Direct -> ${peerId} [${message.type}] failed`, err);
-          }
+          } catch (_) {}
         } else if (typeof conn.once === 'function') {
-          logDebug(`TX Direct -> ${peerId} [${message.type}] queued until DataChannel opens`, message);
           conn.once('open', () => {
             try {
               conn.send(message);
-              logDebug(`TX Direct (flushed queue) -> ${peerId} [${message.type}]`, message);
-            } catch (err) {
-              logWarn(`TX Direct (flushed queue) -> ${peerId} failed`, err);
-            }
+            } catch (_) {}
           });
         }
       }
@@ -948,7 +948,6 @@
       function ensureLeadPolling() {
         if (!state.roomName || state.hostPeerId) return;
         if (state.leadPollTimer) return;
-        logDebug('Starting 2s background poll for LEAD_PEER_ID', { leadId: getLeadPeerId() });
         state.leadPollTimer = setInterval(() => {
           if (state.hostPeerId && state.peers.has(state.hostPeerId)) {
             clearLeadProbeTimers();
@@ -983,7 +982,6 @@
           isSelf: false
         };
         state.peers.set(peerId, entry);
-        logDebug(`Added peer to local roster: ${peerId} (${entry.name})`);
         return entry;
       }
 
@@ -994,43 +992,22 @@
 
         const existingConn = state.dataChannels.get(targetPeerId);
         if (existingConn) {
-          if (existingConn.open) {
-            logDebug(`Mesh connection to ${targetPeerId} already open`);
-            return;
-          }
+          if (existingConn.open) return;
           const ageMs = Date.now() - (existingConn._createdAt || 0);
-          if (ageMs < 8000) {
-            logDebug(`Mesh connection to ${targetPeerId} already negotiating ICE (${ageMs}ms elapsed), waiting...`);
-            return;
-          }
-          logWarn(`Mesh connection to ${targetPeerId} timed out after ${ageMs}ms, replacing`);
+          if (ageMs < 8000) return;
           try { existingConn.close(); } catch (_) {}
           state.dataChannels.delete(targetPeerId);
         }
 
         const shouldDial = forceConnect || (state.myPeerId > targetPeerId);
-        logDebug(`Tie-breaker check for ${targetPeerId}`, {
-          myPeerId: state.myPeerId,
-          targetPeerId,
-          forceConnect,
-          shouldDial
-        });
-
-        if (shouldDial) {
-          if (state.peerInstance && !state.peerInstance.destroyed && state.peerInstance.open) {
-            try {
-              logDebug(`Dialing peer ${targetPeerId}...`);
-              const conn = state.peerInstance.connect(targetPeerId, {
-                reliable: true,
-                serialization: 'json'
-              });
-              registerDataChannel(conn, false);
-            } catch (err) {
-              logWarn(`Failed dialing peer ${targetPeerId}`, err);
-            }
-          } else {
-            logWarn(`Cannot dial ${targetPeerId} — local PeerJS instance not open yet`);
-          }
+        if (shouldDial && state.peerInstance && !state.peerInstance.destroyed && state.peerInstance.open) {
+          try {
+            const conn = state.peerInstance.connect(targetPeerId, {
+              reliable: true,
+              serialization: 'json'
+            });
+            registerDataChannel(conn, false);
+          } catch (_) {}
         }
       }
 
@@ -1043,16 +1020,9 @@
 
         const existingLeadConn = state.dataChannels.get(leadId);
         if (existingLeadConn) {
-          if (existingLeadConn.open) {
-            logDebug(`Probe skipped — already connected to lead ${leadId}`);
-            return;
-          }
+          if (existingLeadConn.open) return;
           const ageMs = Date.now() - (existingLeadConn._createdAt || 0);
-          if (ageMs < 8000) {
-            logDebug(`Probe to lead ${leadId} still negotiating WebRTC ICE (${ageMs}ms elapsed), waiting...`);
-            return;
-          }
-          logWarn(`Previous probe to lead ${leadId} timed out after ${ageMs}ms, cleaning up before retry`);
+          if (ageMs < 8000) return;
           try { existingLeadConn.close(); } catch (_) {}
           state.dataChannels.delete(leadId);
         }
@@ -1069,23 +1039,17 @@
 
         if (state.peerInstance && !state.peerInstance.destroyed && state.peerInstance.open) {
           try {
-            logDebug(`Probing LEAD_PEER_ID: ${leadId} (backgroundPoll=${isBackgroundPoll})`);
             const conn = state.peerInstance.connect(leadId, {
               reliable: true,
               serialization: 'json'
             });
             registerDataChannel(conn, true);
-          } catch (err) {
-            logWarn(`Exception probing LEAD_PEER_ID ${leadId}`, err);
-          }
-        } else {
-          logWarn(`Probe skipped — PeerJS instance not open yet`);
+          } catch (_) {}
         }
 
         state.leadProbeTimeout = setTimeout(() => {
           const activeConn = state.dataChannels.get(leadId);
           if ((!activeConn || !activeConn.open) && !state.hostPeerId) {
-            logDebug(`Probe window elapsed without open connection yet; surfacing Claim/Wait UI while continuing poll`);
             state.isProbingLead = false;
             ensureLeadPolling();
             renderRoomUI();
@@ -1097,7 +1061,6 @@
       function claimLeadByBinding() {
         if (!state.roomName) return;
         const leadId = getLeadPeerId();
-        logDebug(`User clicked Claim 👑 — target LEAD_PEER_ID: ${leadId}`);
 
         // If already bound as LEAD_PEER_ID, just claim host state
         if (state.myPeerId === leadId) {
@@ -1141,7 +1104,7 @@
         state.myPeerId = leadId;
         state.hostPeerId = leadId;
         updateSelfInPeersMap();
-        saveSessionVoteState();
+        saveRoomState();
         renderRoomUI();
 
         initPeerInstance(leadId, true, knownRemotePeers);
@@ -1150,7 +1113,6 @@
       // Prompt Choice 2: Wait -> Retries polling LEAD_PEER_ID at 2-second intervals
       function startWaitingForLead() {
         if (!state.roomName || state.hostPeerId) return;
-        logDebug('User clicked Wait — polling LEAD_PEER_ID every 2s');
         state.isWaitingForLead = true;
         state.isProbingLead = false;
         renderRoomUI();
@@ -1164,28 +1126,9 @@
         const remotePeerId = conn.peer;
         conn._createdAt = Date.now();
 
-        logDebug(`Registering DataChannel with ${remotePeerId} (isLeadProbe=${isLeadProbe})`);
         state.dataChannels.set(remotePeerId, conn);
 
-        // Monitor underlying RTCPeerConnection ICE state for debugging
-        setTimeout(() => {
-          const pc = conn.peerConnection;
-          if (pc) {
-            logDebug(`RTCPeerConnection created for ${remotePeerId}`, {
-              iceConnectionState: pc.iceConnectionState,
-              signalingState: pc.signalingState
-            });
-            pc.addEventListener('iceconnectionstatechange', () => {
-              logDebug(`ICE state change with ${remotePeerId}: ${pc.iceConnectionState}`, {
-                iceGatheringState: pc.iceGatheringState,
-                signalingState: pc.signalingState
-              });
-            });
-          }
-        }, 50);
-
         conn.on('open', () => {
-          logDebug(`DataChannel OPEN with ${remotePeerId}`);
           state.dataChannels.set(remotePeerId, conn);
 
           if (remotePeerId === getLeadPeerId()) {
@@ -1206,23 +1149,18 @@
 
           // Section 4.3 Step 1: Transmit JOIN_REQUEST when connecting to Lead
           if (isLeadProbe || remotePeerId === getLeadPeerId()) {
-            const joinReq = {
+            conn.send({
               type: 'JOIN_REQUEST',
               payload: {
                 peerId: state.myPeerId,
                 name: state.myName || 'Anonymous'
               }
-            };
-            logDebug(`TX Direct -> ${remotePeerId} [JOIN_REQUEST]`, joinReq);
-            conn.send(joinReq);
+            });
           }
 
           // Exchange state hydration on DataChannel open
-          const roomStateMsg = buildSyncRoomStateMessage();
-          const syncMeMsg = buildSyncMeMessage();
-          logDebug(`TX Direct -> ${remotePeerId} [SYNC_ROOM_STATE + SYNC_ME]`, { roomStateMsg, syncMeMsg });
-          conn.send(roomStateMsg);
-          conn.send(syncMeMsg);
+          conn.send(buildSyncRoomStateMessage());
+          conn.send(buildSyncMeMessage());
 
           if (state.isRevealed && state.myVote !== null && state.mySalt) {
             conn.send({
@@ -1235,24 +1173,22 @@
             });
           }
 
+          saveRoomState();
           renderRoomUI();
         });
 
         conn.on('data', (msg) => {
-          logDebug(`RX <- ${remotePeerId} [${msg && msg.type}]`, msg);
           handleIncomingMeshMessage(remotePeerId, msg);
         });
 
         conn.on('close', () => {
-          logWarn(`DataChannel CLOSED with ${remotePeerId}`);
           if (state.dataChannels.get(remotePeerId) === conn) {
             state.dataChannels.delete(remotePeerId);
             handlePeerLeft(remotePeerId);
           }
         });
 
-        conn.on('error', (err) => {
-          logWarn(`DataChannel ERROR with ${remotePeerId}`, err);
+        conn.on('error', () => {
           if (state.dataChannels.get(remotePeerId) === conn) {
             state.dataChannels.delete(remotePeerId);
             handlePeerLeft(remotePeerId);
@@ -1262,16 +1198,15 @@
 
       function handlePeerLeft(remotePeerId) {
         if (!remotePeerId || remotePeerId === state.myPeerId) return;
-        logWarn(`Peer left room: ${remotePeerId}`);
         state.peers.delete(remotePeerId);
         state.dataChannels.delete(remotePeerId);
 
         if (state.hostPeerId === remotePeerId) {
-          logWarn(`Host ${remotePeerId} disconnected — host role is now vacant`);
           state.hostPeerId = null;
           ensureLeadPolling();
         }
         updateSelfInPeersMap();
+        saveRoomState();
         renderRoomUI();
       }
 
@@ -1332,14 +1267,12 @@
             state.dataChannels.forEach((conn, peerId) => {
               if (peerId !== joinerId && conn && conn.open) {
                 try {
-                  logDebug(`TX Direct -> ${peerId} [PEER_ANNOUNCE]`, announceMsg);
                   conn.send(announceMsg);
-                } catch (err) {
-                  logWarn(`Failed sending PEER_ANNOUNCE to ${peerId}`, err);
-                }
+                } catch (_) {}
               }
             });
 
+            saveRoomState();
             renderRoomUI();
             break;
           }
@@ -1395,6 +1328,7 @@
             }
 
             updateSelfInPeersMap();
+            saveRoomState();
             sendToPeer(senderPeerId, buildSyncMeMessage());
             renderRoomUI();
             break;
@@ -1409,6 +1343,7 @@
 
             ensurePeerEntry(newPeerId, newPeerName);
             connectToPeerWithTieBreaker(newPeerId, newPeerName);
+            saveRoomState();
             renderRoomUI();
             break;
           }
@@ -1443,6 +1378,7 @@
               }
             }
             updateSelfInPeersMap();
+            saveRoomState();
             renderRoomUI();
             break;
           }
@@ -1498,6 +1434,7 @@
 
             state.peers.set(peerId, updatedPeer);
             updateSelfInPeersMap();
+            saveRoomState();
 
             if (shouldReplySync) {
               sendToPeer(peerId, buildSyncRoomStateMessage());
@@ -1521,6 +1458,7 @@
               peer.revealedSalt = null;
               peer.verified = null;
               state.peers.set(targetId, peer);
+              saveRoomState();
               renderRoomUI();
             }
             break;
@@ -1529,6 +1467,7 @@
           case 'TRIGGER_REVEAL': {
             state.isRevealed = true;
             updateSelfInPeersMap();
+            saveRoomState();
 
             if (state.myVote !== null && state.mySalt) {
               broadcastToMesh({
@@ -1569,6 +1508,7 @@
               peer.verified = false;
             }
             state.peers.set(targetId, peer);
+            saveRoomState();
             renderRoomUI();
             break;
           }
@@ -1590,7 +1530,7 @@
               p.isHost = (id === newHostId);
             });
             updateSelfInPeersMap();
-            saveSessionVoteState();
+            saveRoomState();
             renderRoomUI();
             break;
           }
@@ -1619,8 +1559,8 @@
           state.myCommitHash = await computeCommitHash(fibValue, state.mySalt);
         }
 
-        saveSessionVoteState();
         updateSelfInPeersMap();
+        saveRoomState();
 
         broadcastToMesh({
           type: 'VOTE_COMMITTED',
@@ -1637,6 +1577,7 @@
         if (state.hostPeerId !== state.myPeerId) return;
         state.isRevealed = true;
         updateSelfInPeersMap();
+        saveRoomState();
 
         broadcastToMesh({ type: 'TRIGGER_REVEAL' });
 
@@ -1660,7 +1601,6 @@
         state.myVote = null;
         state.mySalt = null;
         state.myCommitHash = null;
-        saveSessionVoteState();
 
         state.peers.forEach((p) => {
           p.commitHash = null;
@@ -1670,6 +1610,7 @@
         });
 
         updateSelfInPeersMap();
+        saveRoomState();
         renderRoomUI();
       }
 
@@ -1694,7 +1635,7 @@
           p.isHost = (id === targetPeerId);
         });
         updateSelfInPeersMap();
-        saveSessionVoteState();
+        saveRoomState();
 
         broadcastToMesh({
           type: 'SET_HOST',
@@ -1737,20 +1678,12 @@
       }
 
       function initPeerInstance(requestedId, isClaimingLead = false, reconnectPeers = []) {
-        logDebug(`Initializing PeerJS instance`, {
-          requestedId,
-          roomName: state.roomName,
-          leadPeerId: getLeadPeerId(),
-          isClaimingLead,
-          reconnectPeers
-        });
-
         try {
           const peer = new Peer(requestedId, {
             host: '0.peerjs.com',
             port: 443,
             secure: true,
-            debug: 2,
+            debug: 0,
             config: {
               iceServers: [
                 { urls: 'stun:stun.l.google.com:19302' },
@@ -1766,19 +1699,14 @@
             if (isClaimingLead) {
               state.hostPeerId = id;
             }
-            logDebug(`PeerJS signaling WebSocket OPEN on 0.peerjs.com`, {
-              boundPeerId: id,
-              hostPeerId: state.hostPeerId,
-              isClaimingLead
-            });
 
             updateSelfInPeersMap();
-            saveSessionVoteState();
+            saveRoomState();
             renderRoomUI();
 
             if (isClaimingLead) {
               reconnectPeers.forEach((p) => {
-                connectToPeerWithTieBreaker(p.id, p.name, true);
+                connectToPeerWithTieBreaker(p.id || p.peerId, p.name, true);
               });
             } else {
               // Step 1: Probe LEAD_PEER_ID upon joining
@@ -1787,31 +1715,37 @@
           });
 
           peer.on('connection', (conn) => {
-            logDebug(`Incoming PeerJS DataConnection from ${conn && conn.peer}`);
             registerDataChannel(conn, false);
           });
 
           peer.on('disconnected', () => {
-            logWarn(`PeerJS signaling WebSocket disconnected from 0.peerjs.com — attempting reconnect...`);
             try {
               if (!peer.destroyed) peer.reconnect();
-            } catch (err) {
-              logWarn(`PeerJS reconnect failed`, err);
-            }
-          });
-
-          peer.on('close', () => {
-            logWarn(`PeerJS instance closed (${requestedId})`);
+            } catch (_) {}
           });
 
           peer.on('error', (err) => {
-            logWarn(`PeerJS error event [type=${err && err.type}]: ${err && err.message}`, err);
-
-            // When probing LEAD_PEER_ID and no lead exists on 0.peerjs.com,
-            // PeerJS emits 'peer-unavailable'. Immediately surface Claim / Wait choice
-            // and start background 2s polling so when someone claims 👑, we connect automatically.
+            // When probing LEAD_PEER_ID or dialing a cached peer that is no longer online,
+            // PeerJS emits 'peer-unavailable' with message "Could not connect to peer <id>".
             if (err && err.type === 'peer-unavailable') {
+              const match = err.message && err.message.match(/peer\s+([A-Za-z0-9_-]+)/i);
+              const unavailablePeerId = match ? match[1] : null;
               const leadId = getLeadPeerId();
+
+              if (unavailablePeerId && unavailablePeerId !== leadId) {
+                const staleConn = state.dataChannels.get(unavailablePeerId);
+                if (staleConn) {
+                  state.dataChannels.delete(unavailablePeerId);
+                  try { staleConn.close(); } catch (_) {}
+                }
+                if (state.peers.has(unavailablePeerId)) {
+                  state.peers.delete(unavailablePeerId);
+                  saveRoomState();
+                  renderRoomUI();
+                }
+                return;
+              }
+
               const failedProbe = state.dataChannels.get(leadId);
               if (failedProbe && !failedProbe.open) {
                 state.dataChannels.delete(leadId);
@@ -1830,7 +1764,6 @@
             // If claiming LEAD_PEER_ID failed because another peer just claimed it,
             // fall back to an ephemeral member ID and connect to the lead.
             if (isClaimingLead && err && err.type === 'unavailable-id') {
-              logWarn(`LEAD_PEER_ID (${requestedId}) is already taken on 0.peerjs.com — falling back to member ID and probing lead`);
               try { peer.destroy(); } catch (_) {}
               state.peerInstance = null;
               state.peers.delete(state.myPeerId);
@@ -1838,7 +1771,7 @@
               const fallbackMemberId = generateMemberPeerId();
               state.myPeerId = fallbackMemberId;
               updateSelfInPeersMap();
-              saveSessionVoteState();
+              saveRoomState();
               initPeerInstance(fallbackMemberId, false);
               return;
             }
@@ -1851,8 +1784,7 @@
               renderRoomUI();
             }
           });
-        } catch (err) {
-          logWarn(`Exception creating PeerJS instance`, err);
+        } catch (_) {
           state.myPeerId = requestedId;
           state.isProbingLead = false;
           ensureLeadPolling();
@@ -1864,34 +1796,59 @@
       function startMeshForRoom() {
         teardownNetworking();
 
-        const savedSession = loadSessionVoteState(state.roomName);
-        if (savedSession) {
-          state.joinedAt = savedSession.joinedAt || Date.now();
-          state.myVote = normalizeFibValue(savedSession.myVote);
-          state.mySalt = savedSession.mySalt || null;
-          state.myCommitHash = savedSession.myCommitHash || null;
+        const savedRoom = loadRoomState(state.roomName);
+        const cachedRemotePeers = [];
+        if (savedRoom) {
+          state.joinedAt = savedRoom.joinedAt || Date.now();
+          state.isRevealed = Boolean(savedRoom.isRevealed);
+          state.myVote = normalizeFibValue(savedRoom.myVote);
+          state.mySalt = savedRoom.mySalt || null;
+          state.myCommitHash = savedRoom.myCommitHash || null;
+          if (typeof savedRoom.myIsObserver === 'boolean') {
+            state.myIsObserver = savedRoom.myIsObserver;
+          }
+          if (Array.isArray(savedRoom.participants)) {
+            savedRoom.participants.forEach((p) => {
+              const pid = p && (p.peerId || p.id);
+              if (pid) {
+                state.peers.set(pid, {
+                  peerId: pid,
+                  name: p.name || 'Peer',
+                  isHost: Boolean(p.isHost),
+                  isObserver: Boolean(p.isObserver),
+                  commitHash: p.commitHash || null,
+                  revealedVote: normalizeFibValue(p.revealedVote),
+                  revealedSalt: p.revealedSalt || null,
+                  verified: p.verified ?? null,
+                  joinedAt: p.joinedAt || Date.now(),
+                  connected: false,
+                  isSelf: false
+                });
+                cachedRemotePeers.push({ id: pid, name: p.name || 'Peer' });
+              }
+            });
+          }
         } else {
           state.joinedAt = Date.now();
+          state.isRevealed = false;
           state.myVote = null;
           state.mySalt = null;
           state.myCommitHash = null;
         }
 
         // If this tab was previously the Lead before a page refresh, re-bind as LEAD_PEER_ID
-        if (savedSession && savedSession.wasLead) {
+        if (savedRoom && savedRoom.wasLead) {
           const leadId = getLeadPeerId(state.roomName);
-          logDebug(`Restoring previous Lead session for room #${state.roomName}`, { leadId });
           state.myPeerId = leadId;
           state.hostPeerId = leadId;
           updateSelfInPeersMap();
           renderRoomUI();
-          initPeerInstance(leadId, true);
+          initPeerInstance(leadId, true, cachedRemotePeers);
           return;
         }
 
         // Section 4.2: Ephemeral Member Peer ID on initial join
         const memberPeerId = generateMemberPeerId(state.roomName);
-        logDebug(`Starting mesh as Member for room #${state.roomName}`, { memberPeerId, targetLeadId: getLeadPeerId(state.roomName) });
         state.myPeerId = memberPeerId;
         updateSelfInPeersMap();
         renderRoomUI();
@@ -2184,12 +2141,10 @@
         el.btnEditProfile.classList.add('inline-flex');
         el.headerRoomName.textContent = sanitized;
 
-        const savedSession = loadSessionVoteState(sanitized);
-        if (savedSession && savedSession.onboarded && (savedSession.myName || state.myName)) {
-          state.myName = savedSession.myName || state.myName;
-          if (typeof savedSession.myIsObserver === 'boolean') {
-            state.myIsObserver = savedSession.myIsObserver;
-          }
+        const savedRoom = loadRoomState(sanitized);
+        state.myIsObserver = Boolean(savedRoom && savedRoom.myIsObserver);
+        if (savedRoom && savedRoom.onboarded && (savedRoom.myName || state.myName)) {
+          state.myName = state.myName || savedRoom.myName;
           state.isOnboarded = true;
           startMeshForRoom();
         } else {
@@ -2305,7 +2260,6 @@
           state.isOnboarded = true;
 
           localStorage.setItem(STORAGE_KEYS.NAME, name);
-          localStorage.setItem(STORAGE_KEYS.OBSERVER, String(isObserver));
 
           if (isObserver) {
             state.myVote = null;
@@ -2313,13 +2267,14 @@
             state.myCommitHash = null;
           }
 
-          saveSessionVoteState();
+          saveRoomState();
           closeOnboardingModal();
 
           if (!state.peerInstance && !state.myPeerId) {
             startMeshForRoom();
           } else {
             updateSelfInPeersMap();
+            saveRoomState();
             broadcastToMesh(buildSyncMeMessage());
             renderRoomUI();
           }
@@ -2333,8 +2288,8 @@
 
         el.btnSwitchToVoter.addEventListener('click', () => {
           state.myIsObserver = false;
-          localStorage.setItem(STORAGE_KEYS.OBSERVER, 'false');
           updateSelfInPeersMap();
+          saveRoomState();
           broadcastToMesh(buildSyncMeMessage());
           renderRoomUI();
         });
