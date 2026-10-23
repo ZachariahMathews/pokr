@@ -40,9 +40,8 @@
     };
   </script>
 
-  <!-- PeerJS & MQTT.js -->
+  <!-- PeerJS (HTTPS/WSS Port 443 Signaling via 0.peerjs.com) -->
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-  <script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
 
   <style>
     :root {
@@ -304,16 +303,25 @@
 
     <!-- LEFT SIDEBAR: PARTICIPANTS (Voted / Waiting / Observer) -->
     <aside class="w-full md:w-56 shrink-0 bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-2xl p-4 flex flex-col gap-5">
-      <!-- Vacant Crown Claim Button (shown only if no host in room) -->
-      <div id="vacant-lead-banner" class="hidden">
-        <button
-          id="btn-claim-lead"
-          type="button"
-          class="w-full py-1.5 px-3 rounded-lg font-medium text-xs bg-env-gold/20 hover:bg-env-gold text-[var(--text-primary)] hover:text-env-darkgray border border-env-gold/40 transition-colors flex items-center justify-center gap-1.5"
-        >
-          <span>👑</span>
-          <span>Claim</span>
-        </button>
+      <!-- Vacant Crown Prompt (shown when no host in room: Claim or Wait) -->
+      <div id="vacant-lead-banner" class="hidden space-y-1.5">
+        <div class="flex items-center gap-1.5">
+          <button
+            id="btn-claim-lead"
+            type="button"
+            class="flex-1 py-1.5 px-2.5 rounded-lg font-medium text-xs bg-env-gold/20 hover:bg-env-gold text-[var(--text-primary)] hover:text-env-darkgray border border-env-gold/40 transition-colors flex items-center justify-center gap-1.5"
+          >
+            <span>👑</span>
+            <span>Claim</span>
+          </button>
+          <button
+            id="btn-wait-lead"
+            type="button"
+            class="flex-1 py-1.5 px-2.5 rounded-lg font-medium text-xs bg-[var(--bg-canvas)] hover:border-env-blue dark:hover:border-env-lightblue text-[var(--text-secondary)] hover:text-[var(--text-primary)] border border-[var(--border-subtle)] transition-colors flex items-center justify-center"
+          >
+            <span id="wait-lead-text">Wait</span>
+          </button>
+        </div>
       </div>
 
       <!-- 1. Voted -->
@@ -356,6 +364,28 @@
         <!-- Voted Participants Cards -->
         <div id="participants-grid" class="w-full flex flex-wrap items-center justify-center gap-5">
           <!-- Only participants who have voted are rendered here -->
+        </div>
+
+        <!-- Vacant Crown Center Prompt (shown when initial probe finds no host yet) -->
+        <div id="prompt-vacant-lead" class="hidden flex-col items-center justify-center gap-3 p-5 rounded-2xl bg-[var(--bg-surface)]/95 border border-[var(--border-subtle)] shadow-lg text-center max-w-xs w-full">
+          <div class="text-2xl leading-none">👑</div>
+          <div class="flex items-center gap-2 w-full">
+            <button
+              id="btn-center-claim-lead"
+              type="button"
+              class="flex-1 py-2 px-3 rounded-lg font-medium text-xs bg-env-blue hover:bg-env-darkblue text-white transition-colors flex items-center justify-center gap-1.5 shadow-xs"
+            >
+              <span>👑</span>
+              <span>Claim</span>
+            </button>
+            <button
+              id="btn-center-wait-lead"
+              type="button"
+              class="flex-1 py-2 px-3 rounded-lg font-medium text-xs bg-[var(--bg-canvas)] hover:border-env-blue dark:hover:border-env-lightblue text-[var(--text-secondary)] hover:text-[var(--text-primary)] border border-[var(--border-subtle)] transition-colors flex items-center justify-center"
+            >
+              <span>Wait</span>
+            </button>
+          </div>
         </div>
 
         <!-- HOST FAB CONTROLS (Bottom-right corner of middle section, shown only for host) -->
@@ -468,12 +498,6 @@
       // -------------------------------------------------------------------
       const FIB_DECK = [0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, '?', '☕'];
 
-      const MQTT_BROKERS = [
-        'wss://broker.emqx.io:8084/mqtt',
-        'wss://test.mosquitto.org:8081/mqtt',
-        'wss://broker.hivemq.com:8884/mqtt'
-      ];
-
       const STORAGE_KEYS = {
         THEME: 'pokr_theme',
         NAME: 'pokr_display_name',
@@ -495,6 +519,12 @@
         isRevealed: false,
         confettiFiredForRound: false,
 
+        // Section 4.3 Discovery & Probe State
+        isProbingLead: false,
+        isWaitingForLead: false,
+        leadProbeTimeout: null,
+        leadPollTimer: null,
+
         myVote: null,       // FibValue | null
         mySalt: null,       // 16-char hex string (8 random bytes)
         myCommitHash: null, // 64-char hex string SHA-256(value + ":" + salt)
@@ -503,10 +533,7 @@
 
         peerInstance: null,
         dataChannels: new Map(),
-        mqttClient: null,
         broadcastChannel: null,
-        announceTimer: null,
-        hostElectionTimer: null,
         isOnboarded: false
       };
 
@@ -527,6 +554,11 @@
 
         vacantLeadBanner: document.getElementById('vacant-lead-banner'),
         btnClaimLead: document.getElementById('btn-claim-lead'),
+        btnWaitLead: document.getElementById('btn-wait-lead'),
+        waitLeadText: document.getElementById('wait-lead-text'),
+        promptVacantLead: document.getElementById('prompt-vacant-lead'),
+        btnCenterClaimLead: document.getElementById('btn-center-claim-lead'),
+        btnCenterWaitLead: document.getElementById('btn-center-wait-lead'),
 
         // Sidebar Lists
         sidebarListVoted: document.getElementById('sidebar-list-voted'),
@@ -694,10 +726,17 @@
         return String(raw || '')
           .trim()
           .toLowerCase()
-          .replace(/[^a-z0-9-_]/g, '-')
-          .replace(/-+/g, '-')
-          .replace(/^-|-$/g, '')
-          .slice(0, 48);
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-+|-+$/g, '')
+          .slice(0, 40);
+      }
+
+      // Ensures ID strictly conforms to PeerJS validateId (/^[A-Za-z0-9]+(?:[ _-][A-Za-z0-9]+)*$/)
+      function toValidPeerId(raw) {
+        return String(raw || '')
+          .replace(/[^A-Za-z0-9_-]+/g, '-')
+          .replace(/[_-]{2,}/g, '_')
+          .replace(/^[_-]+|[_-]+$/g, '');
       }
 
       function generateRandomSlug() {
@@ -714,6 +753,9 @@
             STORAGE_KEYS.SESSION_PREFIX + state.roomName,
             JSON.stringify({
               onboarded: state.isOnboarded,
+              myName: state.myName,
+              myIsObserver: state.myIsObserver,
+              wasLead: Boolean(state.myPeerId && state.hostPeerId === state.myPeerId),
               joinedAt: state.joinedAt,
               myVote: state.myVote,
               mySalt: state.mySalt,
@@ -768,6 +810,17 @@
       // -------------------------------------------------------------------
       // 7. STATE & MESH TRANSPORT (Sections 4 & 5)
       // -------------------------------------------------------------------
+      function getLeadPeerId(room = state.roomName) {
+        return toValidPeerId(`${room}__lead`);
+      }
+
+      function generateMemberPeerId(room = state.roomName) {
+        const uuidSlice = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+          ? crypto.randomUUID().replace(/-/g, '').slice(0, 8)
+          : Math.random().toString(36).substring(2, 10);
+        return toValidPeerId(`${room}__member_${uuidSlice}`);
+      }
+
       function updateSelfInPeersMap() {
         if (!state.myPeerId) return;
         const existing = state.peers.get(state.myPeerId) || {};
@@ -825,10 +878,10 @@
             try { conn.send(message); } catch (_) {}
           }
         });
-        if (state.broadcastChannel) {
+        if (state.broadcastChannel && state.myPeerId) {
           try {
             state.broadcastChannel.postMessage({
-              __bridge: 'DATA',
+              __bridge: 'BROADCAST',
               fromPeerId: state.myPeerId,
               message
             });
@@ -837,17 +890,24 @@
       }
 
       function sendToPeer(peerId, message) {
+        if (!peerId || peerId === state.myPeerId) return;
         const conn = state.dataChannels.get(peerId);
-        if (conn && conn.open) {
-          try {
-            conn.send(message);
-            return;
-          } catch (_) {}
+        if (conn) {
+          if (conn.open) {
+            try {
+              conn.send(message);
+              return;
+            } catch (_) {}
+          } else if (typeof conn.once === 'function') {
+            conn.once('open', () => {
+              try { conn.send(message); } catch (_) {}
+            });
+          }
         }
-        if (state.broadcastChannel) {
+        if (state.broadcastChannel && state.myPeerId) {
           try {
             state.broadcastChannel.postMessage({
-              __bridge: 'DATA_DIRECT',
+              __bridge: 'DIRECT',
               fromPeerId: state.myPeerId,
               toPeerId: peerId,
               message
@@ -857,111 +917,248 @@
       }
 
       // -------------------------------------------------------------------
-      // 8. DISCOVERY & HANDSHAKE (Section 4.1 - 4.3)
+      // 8. ENTERPRISE-SAFE DISCOVERY & MESH ASSEMBLY VIA PEERJS (Section 4)
       // -------------------------------------------------------------------
-      function getDiscoveryTopic() {
-        return `poker/rooms/${state.roomName}/discovery`;
+      function clearLeadProbeTimers() {
+        if (state.leadProbeTimeout) {
+          clearTimeout(state.leadProbeTimeout);
+          state.leadProbeTimeout = null;
+        }
+        if (state.leadPollTimer) {
+          clearInterval(state.leadPollTimer);
+          state.leadPollTimer = null;
+        }
       }
 
-      function publishPresenceAnnouncement() {
-        if (!state.myPeerId || !state.roomName) return;
-        const payload = {
-          type: 'ANNOUNCE_PRESENCE',
-          peerId: state.myPeerId,
-          name: state.myName || 'Anonymous',
-          joinedAt: state.joinedAt
-        };
-        const topic = getDiscoveryTopic();
+      function ensureLeadPolling() {
+        if (!state.roomName || state.hostPeerId) return;
+        if (state.leadPollTimer) return;
+        state.leadPollTimer = setInterval(() => {
+          if (state.hostPeerId && state.peers.has(state.hostPeerId)) {
+            clearLeadProbeTimers();
+            state.isWaitingForLead = false;
+            renderRoomUI();
+            return;
+          }
+          probeLeadConnection(true);
+        }, 2000);
+      }
 
-        if (state.mqttClient && state.mqttClient.connected) {
-          try {
-            state.mqttClient.publish(topic, JSON.stringify(payload), { qos: 0 });
-          } catch (_) {}
+      function ensurePeerEntry(peerId, name) {
+        if (!peerId || peerId === state.myPeerId) return null;
+        const existing = state.peers.get(peerId);
+        if (existing) {
+          if (name && (!existing.name || existing.name === 'Peer')) {
+            existing.name = name;
+          }
+          return existing;
+        }
+        const entry = {
+          peerId,
+          name: name || 'Peer',
+          isHost: state.hostPeerId === peerId,
+          isObserver: false,
+          commitHash: null,
+          revealedVote: null,
+          revealedSalt: null,
+          verified: null,
+          joinedAt: Date.now(),
+          connected: false,
+          isSelf: false
+        };
+        state.peers.set(peerId, entry);
+        return entry;
+      }
+
+      // Section 4.3 Step 3: Mesh Interconnection with strict tie-breaker (myPeerId > targetPeerId)
+      function connectToPeerWithTieBreaker(targetPeerId, targetName, forceConnect = false) {
+        if (!targetPeerId || targetPeerId === state.myPeerId) return;
+        ensurePeerEntry(targetPeerId, targetName);
+
+        const existingConn = state.dataChannels.get(targetPeerId);
+        if (existingConn && existingConn.open) return;
+
+        if (forceConnect || state.myPeerId > targetPeerId) {
+          if (state.peerInstance && !state.peerInstance.destroyed && state.peerInstance.open) {
+            try {
+              const conn = state.peerInstance.connect(targetPeerId, {
+                reliable: true,
+                serialization: 'json'
+              });
+              registerDataChannel(conn);
+            } catch (_) {}
+          }
         }
 
         if (state.broadcastChannel) {
-          try {
-            state.broadcastChannel.postMessage({
-              __bridge: 'DISCOVERY',
-              payload
-            });
-          } catch (_) {}
+          sendToPeer(targetPeerId, buildSyncRoomStateMessage());
+          sendToPeer(targetPeerId, buildSyncMeMessage());
         }
       }
 
-      function handlePresenceAnnouncement(data) {
-        if (!data || data.type !== 'ANNOUNCE_PRESENCE') return;
-        const incomingPeerId = data.peerId;
-        if (!incomingPeerId || incomingPeerId === state.myPeerId) return;
+      // Section 4.3 Step 1: Initial Connection Probe to LEAD_PEER_ID
+      function probeLeadConnection(isBackgroundPoll = false) {
+        if (!state.roomName) return;
+        const leadId = getLeadPeerId();
+        if (state.myPeerId === leadId) return;
+        if (state.hostPeerId && state.peers.has(state.hostPeerId)) return;
 
-        const existing = state.peers.get(incomingPeerId);
-        if (!existing) {
-          state.peers.set(incomingPeerId, {
-            peerId: incomingPeerId,
-            name: data.name || 'Peer',
-            isHost: state.hostPeerId === incomingPeerId,
-            isObserver: false,
-            commitHash: null,
-            revealedVote: null,
-            revealedSalt: null,
-            verified: null,
-            joinedAt: data.joinedAt || Date.now(),
-            connected: false,
-            isSelf: false
-          });
+        const existingLeadConn = state.dataChannels.get(leadId);
+        if (existingLeadConn && existingLeadConn.open) return;
+
+        if (state.leadProbeTimeout) {
+          clearTimeout(state.leadProbeTimeout);
+          state.leadProbeTimeout = null;
         }
 
-        const existingConn = state.dataChannels.get(incomingPeerId);
-        if (existingConn && existingConn.open) return;
+        if (!isBackgroundPoll) {
+          state.isProbingLead = true;
+          renderRoomUI();
+        }
 
-        // Section 4.2.4: Deterministic Tie-Breaker (myPeerId > incomingPeerId dials)
-        if (state.myPeerId > incomingPeerId) {
-          if (state.peerInstance && !state.peerInstance.destroyed) {
-            const conn = state.peerInstance.connect(incomingPeerId, {
+        // Also probe over BroadcastChannel for instant local multi-tab discovery when a lead is bound
+        if (state.broadcastChannel && state.myPeerId) {
+          try {
+            state.broadcastChannel.postMessage({
+              __bridge: 'DIRECT',
+              fromPeerId: state.myPeerId,
+              toPeerId: leadId,
+              message: {
+                type: 'JOIN_REQUEST',
+                payload: {
+                  peerId: state.myPeerId,
+                  name: state.myName || 'Anonymous'
+                }
+              }
+            });
+          } catch (_) {}
+        }
+
+        if (state.peerInstance && !state.peerInstance.destroyed && state.peerInstance.open) {
+          try {
+            const conn = state.peerInstance.connect(leadId, {
               reliable: true,
               serialization: 'json'
             });
-            registerDataChannel(conn);
-          }
-        } else {
-          if (!existing || !existing._reannounced) {
-            const p = state.peers.get(incomingPeerId);
-            if (p) p._reannounced = true;
-            setTimeout(() => publishPresenceAnnouncement(), 120);
-          }
+            registerDataChannel(conn, true);
+          } catch (_) {}
         }
 
-        if (state.broadcastChannel) {
-          sendToPeer(incomingPeerId, buildSyncRoomStateMessage());
-          sendToPeer(incomingPeerId, buildSyncMeMessage());
-        }
-
-        renderRoomUI();
+        state.leadProbeTimeout = setTimeout(() => {
+          const activeConn = state.dataChannels.get(leadId);
+          if ((!activeConn || !activeConn.open) && !state.hostPeerId) {
+            state.isProbingLead = false;
+            ensureLeadPolling();
+            renderRoomUI();
+          }
+        }, 2200);
       }
 
-      function registerDataChannel(conn) {
+      // Prompt Choice 1: Claim 👑 -> Re-initialize PeerJS binding explicitly to LEAD_PEER_ID
+      function claimLeadByBinding() {
+        if (!state.roomName) return;
+        const leadId = getLeadPeerId();
+
+        // If already bound as LEAD_PEER_ID, just claim host state
+        if (state.myPeerId === leadId) {
+          assignHostRole(leadId);
+          return;
+        }
+
+        // Preserve known peers before re-binding to LEAD_PEER_ID
+        const knownRemotePeers = [];
+        state.peers.forEach((p, id) => {
+          if (id !== state.myPeerId) {
+            knownRemotePeers.push({ id, name: p.name });
+          }
+        });
+
+        const oldPeerId = state.myPeerId;
+        clearLeadProbeTimers();
+        state.isProbingLead = false;
+        state.isWaitingForLead = false;
+
+        if (oldPeerId) {
+          broadcastToMesh({
+            type: 'PEER_LEAVING',
+            payload: { peerId: oldPeerId }
+          });
+        }
+
+        state.dataChannels.forEach((conn) => {
+          try { conn.close(); } catch (_) {}
+        });
+        state.dataChannels.clear();
+
+        if (state.peerInstance) {
+          try { state.peerInstance.destroy(); } catch (_) {}
+          state.peerInstance = null;
+        }
+
+        if (oldPeerId) {
+          state.peers.delete(oldPeerId);
+        }
+        state.myPeerId = leadId;
+        state.hostPeerId = leadId;
+        updateSelfInPeersMap();
+        saveSessionVoteState();
+        renderRoomUI();
+
+        initPeerInstance(leadId, true, knownRemotePeers);
+      }
+
+      // Prompt Choice 2: Wait -> Retries polling LEAD_PEER_ID at 2-second intervals
+      function startWaitingForLead() {
+        if (!state.roomName || state.hostPeerId) return;
+        state.isWaitingForLead = true;
+        state.isProbingLead = false;
+        renderRoomUI();
+
+        probeLeadConnection(true);
+        ensureLeadPolling();
+      }
+
+      function registerDataChannel(conn, isLeadProbe = false) {
         if (!conn || !conn.peer) return;
         const remotePeerId = conn.peer;
 
+        const prevConn = state.dataChannels.get(remotePeerId);
+        if (prevConn && prevConn !== conn && !prevConn.open) {
+          try { prevConn.close(); } catch (_) {}
+        }
         state.dataChannels.set(remotePeerId, conn);
 
         conn.on('open', () => {
           state.dataChannels.set(remotePeerId, conn);
-          const p = state.peers.get(remotePeerId) || {
-            peerId: remotePeerId,
-            name: 'Peer',
-            isHost: state.hostPeerId === remotePeerId,
-            isObserver: false,
-            commitHash: null,
-            revealedVote: null,
-            revealedSalt: null,
-            verified: null,
-            joinedAt: Date.now()
-          };
-          p.connected = true;
-          state.peers.set(remotePeerId, p);
 
-          // Section 4.3: State Hydration on Connection Open
+          if (remotePeerId === getLeadPeerId()) {
+            clearLeadProbeTimers();
+            state.isProbingLead = false;
+            state.isWaitingForLead = false;
+            if (!state.hostPeerId) {
+              state.hostPeerId = remotePeerId;
+            }
+          }
+
+          const p = ensurePeerEntry(remotePeerId, 'Peer');
+          if (p) {
+            p.connected = true;
+            p.isHost = (state.hostPeerId === remotePeerId);
+            state.peers.set(remotePeerId, p);
+          }
+
+          // Section 4.3 Step 1: Transmit JOIN_REQUEST when connecting to Lead
+          if (isLeadProbe || remotePeerId === getLeadPeerId()) {
+            conn.send({
+              type: 'JOIN_REQUEST',
+              payload: {
+                peerId: state.myPeerId,
+                name: state.myName || 'Anonymous'
+              }
+            });
+          }
+
+          // Exchange state hydration on DataChannel open
           conn.send(buildSyncRoomStateMessage());
           conn.send(buildSyncMeMessage());
 
@@ -984,8 +1181,10 @@
         });
 
         const handleDisconnect = () => {
-          state.dataChannels.delete(remotePeerId);
-          handlePeerLeft(remotePeerId);
+          if (state.dataChannels.get(remotePeerId) === conn) {
+            state.dataChannels.delete(remotePeerId);
+            handlePeerLeft(remotePeerId);
+          }
         };
 
         conn.on('close', handleDisconnect);
@@ -999,22 +1198,161 @@
 
         if (state.hostPeerId === remotePeerId) {
           state.hostPeerId = null;
+          ensureLeadPolling();
         }
         updateSelfInPeersMap();
         renderRoomUI();
       }
 
       // -------------------------------------------------------------------
-      // 9. MESSAGE PROTOCOL HANDLER (Section 5.2)
+      // 9. MESSAGE PROTOCOL HANDLER (Sections 4.3, 4.4 & 5.2)
       // -------------------------------------------------------------------
       async function handleIncomingMeshMessage(senderPeerId, msg) {
         if (!msg || typeof msg !== 'object') return;
 
         switch (msg.type) {
+          // Section 4.3 Step 2: Lead receives JOIN_REQUEST, replies with ROSTER_SYNC, and broadcasts PEER_ANNOUNCE
+          case 'JOIN_REQUEST': {
+            const payload = msg.payload || {};
+            const joinerId = payload.peerId || senderPeerId;
+            const joinerName = payload.name || 'Peer';
+            if (!joinerId || joinerId === state.myPeerId) return;
+
+            const existing = ensurePeerEntry(joinerId, joinerName);
+            if (existing) {
+              existing.name = joinerName;
+              existing.connected = true;
+              state.peers.set(joinerId, existing);
+            }
+
+            const rosterPeers = [];
+            const committedPeers = [];
+            state.peers.forEach((p, id) => {
+              if (p.commitHash) committedPeers.push(id);
+              if (id !== joinerId) {
+                rosterPeers.push({
+                  id,
+                  name: p.name || 'Peer'
+                });
+              }
+            });
+
+            // 1. Reply directly to the new joiner with ROSTER_SYNC
+            sendToPeer(joinerId, {
+              type: 'ROSTER_SYNC',
+              payload: {
+                peers: rosterPeers,
+                hostPeerId: state.hostPeerId || state.myPeerId,
+                isRevealed: state.isRevealed,
+                committedPeers
+              }
+            });
+            sendToPeer(joinerId, buildSyncRoomStateMessage());
+            sendToPeer(joinerId, buildSyncMeMessage());
+
+            // 2. Broadcast PEER_ANNOUNCE to all other currently connected members
+            const announceMsg = {
+              type: 'PEER_ANNOUNCE',
+              payload: {
+                id: joinerId,
+                name: joinerName
+              }
+            };
+            state.dataChannels.forEach((conn, peerId) => {
+              if (peerId !== joinerId && conn && conn.open) {
+                try {
+                  conn.send(announceMsg);
+                } catch (_) {}
+              }
+            });
+            if (state.broadcastChannel && state.myPeerId) {
+              try {
+                state.broadcastChannel.postMessage({
+                  __bridge: 'BROADCAST',
+                  fromPeerId: state.myPeerId,
+                  message: announceMsg
+                });
+              } catch (_) {}
+            }
+
+            renderRoomUI();
+            break;
+          }
+
+          // Section 4.3 Step 2 & 3: Joiner receives ROSTER_SYNC and connects to listed peers via tie-breaker
+          case 'ROSTER_SYNC': {
+            const { peers, hostPeerId, isRevealed, committedPeers } = msg.payload || {};
+
+            clearLeadProbeTimers();
+            state.isProbingLead = false;
+            state.isWaitingForLead = false;
+
+            if (hostPeerId) {
+              state.hostPeerId = hostPeerId;
+            } else if (!state.hostPeerId) {
+              state.hostPeerId = senderPeerId;
+            }
+
+            if (Array.isArray(peers)) {
+              peers.forEach((peerInfo) => {
+                const pid = peerInfo && (peerInfo.id || peerInfo.peerId);
+                const pname = (peerInfo && peerInfo.name) || 'Peer';
+                if (pid && pid !== state.myPeerId) {
+                  ensurePeerEntry(pid, pname);
+                  connectToPeerWithTieBreaker(pid, pname);
+                }
+              });
+            }
+
+            if (Array.isArray(committedPeers)) {
+              committedPeers.forEach((cid) => {
+                if (cid && cid !== state.myPeerId) {
+                  const cp = ensurePeerEntry(cid);
+                  if (cp && !cp.commitHash) cp.commitHash = 'committed';
+                }
+              });
+            }
+
+            if (isRevealed && !state.isRevealed) {
+              state.isRevealed = true;
+              if (state.myVote !== null && state.mySalt) {
+                broadcastToMesh({
+                  type: 'VOTE_REVEALED',
+                  payload: {
+                    peerId: state.myPeerId,
+                    value: state.myVote,
+                    salt: state.mySalt
+                  }
+                });
+              }
+            }
+
+            updateSelfInPeersMap();
+            sendToPeer(senderPeerId, buildSyncMeMessage());
+            renderRoomUI();
+            break;
+          }
+
+          // Section 4.3 Step 2 & 3: Existing member receives PEER_ANNOUNCE and connects via tie-breaker
+          case 'PEER_ANNOUNCE': {
+            const payload = msg.payload || {};
+            const newPeerId = payload.id || payload.newPeerId || payload.peerId;
+            const newPeerName = payload.name || 'Peer';
+            if (!newPeerId || newPeerId === state.myPeerId) return;
+
+            ensurePeerEntry(newPeerId, newPeerName);
+            connectToPeerWithTieBreaker(newPeerId, newPeerName);
+            renderRoomUI();
+            break;
+          }
+
           case 'SYNC_ROOM_STATE': {
             const { hostPeerId, isRevealed, committedPeers } = msg.payload || {};
             if (hostPeerId && !state.hostPeerId) {
               state.hostPeerId = hostPeerId;
+              clearLeadProbeTimers();
+              state.isProbingLead = false;
+              state.isWaitingForLead = false;
             }
             if (Array.isArray(committedPeers)) {
               committedPeers.forEach((cid) => {
@@ -1066,14 +1404,10 @@
             };
 
             if (pData.isHost) {
-              if (!state.hostPeerId || !state.peers.has(state.hostPeerId)) {
-                state.hostPeerId = peerId;
-              } else if (state.hostPeerId === state.myPeerId && state.myPeerId !== peerId) {
-                if ((pData.joinedAt || 0) < state.joinedAt ||
-                    ((pData.joinedAt || 0) === state.joinedAt && peerId < state.myPeerId)) {
-                  state.hostPeerId = peerId;
-                }
-              }
+              state.hostPeerId = peerId;
+              clearLeadProbeTimers();
+              state.isProbingLead = false;
+              state.isWaitingForLead = false;
             }
 
             if (pData.isRevealed && !state.isRevealed) {
@@ -1177,14 +1511,19 @@
             break;
           }
 
+          // Section 4.4: Mid-Session Host Transfer Under PeerJS Relay
           case 'SET_HOST': {
             const newHostId = (msg.payload && (msg.payload.newHostId || msg.payload.hostId)) || msg.hostId;
             if (!newHostId) return;
             state.hostPeerId = newHostId;
+            clearLeadProbeTimers();
+            state.isProbingLead = false;
+            state.isWaitingForLead = false;
             state.peers.forEach((p, id) => {
               p.isHost = (id === newHostId);
             });
             updateSelfInPeersMap();
+            saveSessionVoteState();
             renderRoomUI();
             break;
           }
@@ -1273,20 +1612,25 @@
         broadcastToMesh({ type: 'RESET_BOARD' });
       }
 
+      // Section 4.4: In-band host transfer over existing DataChannels
       function assignHostRole(targetPeerId) {
         const isCurrentLead = state.hostPeerId === state.myPeerId;
         const isLeadVacant = !state.hostPeerId || !state.peers.has(state.hostPeerId);
         if (!isCurrentLead && !isLeadVacant) return;
 
         state.hostPeerId = targetPeerId;
+        clearLeadProbeTimers();
+        state.isProbingLead = false;
+        state.isWaitingForLead = false;
+
         state.peers.forEach((p, id) => {
           p.isHost = (id === targetPeerId);
         });
         updateSelfInPeersMap();
+        saveSessionVoteState();
 
         broadcastToMesh({
           type: 'SET_HOST',
-          hostId: targetPeerId,
           payload: {
             newHostId: targetPeerId
           }
@@ -1296,17 +1640,12 @@
       }
 
       // -------------------------------------------------------------------
-      // 11. NETWORK LIFECYCLE
+      // 11. NETWORK LIFECYCLE (Section 4.1 - 4.3)
       // -------------------------------------------------------------------
       function teardownNetworking() {
-        if (state.announceTimer) {
-          clearInterval(state.announceTimer);
-          state.announceTimer = null;
-        }
-        if (state.hostElectionTimer) {
-          clearTimeout(state.hostElectionTimer);
-          state.hostElectionTimer = null;
-        }
+        clearLeadProbeTimers();
+        state.isProbingLead = false;
+        state.isWaitingForLead = false;
 
         if (state.myPeerId) {
           broadcastToMesh({
@@ -1319,11 +1658,6 @@
           try { conn.close(); } catch (_) {}
         });
         state.dataChannels.clear();
-
-        if (state.mqttClient) {
-          try { state.mqttClient.end(true); } catch (_) {}
-          state.mqttClient = null;
-        }
 
         if (state.broadcastChannel) {
           try { state.broadcastChannel.close(); } catch (_) {}
@@ -1340,46 +1674,7 @@
         state.hostPeerId = null;
       }
 
-      function startMeshForRoom() {
-        teardownNetworking();
-
-        const savedSession = loadSessionVoteState(state.roomName);
-        if (savedSession) {
-          state.joinedAt = savedSession.joinedAt || Date.now();
-          state.myVote = normalizeFibValue(savedSession.myVote);
-          state.mySalt = savedSession.mySalt || null;
-          state.myCommitHash = savedSession.myCommitHash || null;
-        } else {
-          state.joinedAt = Date.now();
-          state.myVote = null;
-          state.mySalt = null;
-          state.myCommitHash = null;
-        }
-
-        try {
-          state.broadcastChannel = new BroadcastChannel(`poker_room_${state.roomName}`);
-          state.broadcastChannel.onmessage = (ev) => {
-            const data = ev.data;
-            if (!data) return;
-            if (data.__bridge === 'DISCOVERY') {
-              handlePresenceAnnouncement(data.payload);
-            } else if (data.__bridge === 'DATA' && data.fromPeerId !== state.myPeerId) {
-              const dc = state.dataChannels.get(data.fromPeerId);
-              if (!dc || !dc.open) {
-                handleIncomingMeshMessage(data.fromPeerId, data.message);
-              }
-            } else if (data.__bridge === 'DATA_DIRECT' && data.toPeerId === state.myPeerId) {
-              const dc = state.dataChannels.get(data.fromPeerId);
-              if (!dc || !dc.open) {
-                handleIncomingMeshMessage(data.fromPeerId, data.message);
-              }
-            }
-          };
-        } catch (_) {}
-
-        const randomSuffix = Math.random().toString(36).substring(2, 8);
-        const requestedId = `peer-${randomSuffix}-${Date.now().toString(36).slice(-4)}`;
-
+      function initPeerInstance(requestedId, isClaimingLead = false, reconnectPeers = []) {
         try {
           const peer = new Peer(requestedId, {
             host: '0.peerjs.com',
@@ -1398,90 +1693,137 @@
 
           peer.on('open', (id) => {
             state.myPeerId = id;
-            onLocalPeerIdReady();
+            if (isClaimingLead) {
+              state.hostPeerId = id;
+            }
+            updateSelfInPeersMap();
+            saveSessionVoteState();
+            renderRoomUI();
+
+            if (isClaimingLead) {
+              // Notify any local tabs waiting on BroadcastChannel and reconnect known peers
+              broadcastToMesh(buildSyncRoomStateMessage());
+              broadcastToMesh(buildSyncMeMessage());
+              reconnectPeers.forEach((p) => {
+                connectToPeerWithTieBreaker(p.id, p.name, true);
+              });
+            } else {
+              // Step 1: Probe LEAD_PEER_ID upon joining
+              probeLeadConnection(false);
+            }
           });
 
           peer.on('connection', (conn) => {
-            registerDataChannel(conn);
+            registerDataChannel(conn, false);
           });
 
-          peer.on('error', () => {
+          peer.on('error', (err) => {
+            // When probing LEAD_PEER_ID and no lead exists on 0.peerjs.com,
+            // PeerJS emits 'peer-unavailable'. Immediately surface Claim / Wait choice
+            // and start background 2s polling so when someone claims 👑, we connect automatically.
+            if (err && err.type === 'peer-unavailable') {
+              const leadId = getLeadPeerId();
+              const failedProbe = state.dataChannels.get(leadId);
+              if (failedProbe && !failedProbe.open) {
+                state.dataChannels.delete(leadId);
+                try { failedProbe.close(); } catch (_) {}
+              }
+              if (state.leadProbeTimeout) {
+                clearTimeout(state.leadProbeTimeout);
+                state.leadProbeTimeout = null;
+              }
+              state.isProbingLead = false;
+              ensureLeadPolling();
+              renderRoomUI();
+              return;
+            }
+
+            // If claiming LEAD_PEER_ID failed because another peer just claimed it,
+            // fall back to an ephemeral member ID and connect to the lead.
+            if (isClaimingLead && err && err.type === 'unavailable-id') {
+              try { peer.destroy(); } catch (_) {}
+              state.peerInstance = null;
+              state.peers.delete(state.myPeerId);
+              state.hostPeerId = null;
+              const fallbackMemberId = generateMemberPeerId();
+              state.myPeerId = fallbackMemberId;
+              updateSelfInPeersMap();
+              saveSessionVoteState();
+              initPeerInstance(fallbackMemberId, false);
+              return;
+            }
+
             if (!state.myPeerId) {
               state.myPeerId = requestedId;
-              onLocalPeerIdReady();
+              state.isProbingLead = false;
+              ensureLeadPolling();
+              updateSelfInPeersMap();
+              renderRoomUI();
             }
           });
         } catch (_) {
           state.myPeerId = requestedId;
-          onLocalPeerIdReady();
+          state.isProbingLead = false;
+          ensureLeadPolling();
+          updateSelfInPeersMap();
+          renderRoomUI();
         }
       }
 
-      function onLocalPeerIdReady() {
+      function startMeshForRoom() {
+        teardownNetworking();
+
+        const savedSession = loadSessionVoteState(state.roomName);
+        if (savedSession) {
+          state.joinedAt = savedSession.joinedAt || Date.now();
+          state.myVote = normalizeFibValue(savedSession.myVote);
+          state.mySalt = savedSession.mySalt || null;
+          state.myCommitHash = savedSession.myCommitHash || null;
+        } else {
+          state.joinedAt = Date.now();
+          state.myVote = null;
+          state.mySalt = null;
+          state.myCommitHash = null;
+        }
+
+        // Local BroadcastChannel bridge for same-browser multi-tab testing
+        try {
+          state.broadcastChannel = new BroadcastChannel(`poker_room_${state.roomName}`);
+          state.broadcastChannel.onmessage = (ev) => {
+            const data = ev.data;
+            if (!data || !data.fromPeerId || data.fromPeerId === state.myPeerId) return;
+            if (data.__bridge === 'DIRECT' && data.toPeerId === state.myPeerId) {
+              const dc = state.dataChannels.get(data.fromPeerId);
+              if (!dc || !dc.open || data.message?.type === 'JOIN_REQUEST' || data.message?.type === 'ROSTER_SYNC') {
+                handleIncomingMeshMessage(data.fromPeerId, data.message);
+              }
+            } else if (data.__bridge === 'BROADCAST') {
+              const dc = state.dataChannels.get(data.fromPeerId);
+              if (!dc || !dc.open) {
+                handleIncomingMeshMessage(data.fromPeerId, data.message);
+              }
+            }
+          };
+        } catch (_) {}
+
+        // If this tab was previously the Lead before a page refresh, re-bind as LEAD_PEER_ID
+        if (savedSession && savedSession.wasLead) {
+          const leadId = getLeadPeerId(state.roomName);
+          state.myPeerId = leadId;
+          state.hostPeerId = leadId;
+          updateSelfInPeersMap();
+          renderRoomUI();
+          initPeerInstance(leadId, true);
+          return;
+        }
+
+        // Section 4.2: Ephemeral Member Peer ID on initial join
+        const memberPeerId = generateMemberPeerId(state.roomName);
+        state.myPeerId = memberPeerId;
         updateSelfInPeersMap();
         renderRoomUI();
 
-        connectMqttDiscovery(0);
-        publishPresenceAnnouncement();
-
-        let announceCount = 0;
-        state.announceTimer = setInterval(() => {
-          announceCount++;
-          publishPresenceAnnouncement();
-          if (announceCount >= 6) {
-            clearInterval(state.announceTimer);
-            state.announceTimer = null;
-          }
-        }, 1200);
-
-        // First Joiner Default
-        state.hostElectionTimer = setTimeout(() => {
-          if (!state.hostPeerId) {
-            state.hostPeerId = state.myPeerId;
-            updateSelfInPeersMap();
-            broadcastToMesh(buildSyncMeMessage());
-            renderRoomUI();
-          }
-        }, 1400);
-      }
-
-      function connectMqttDiscovery(brokerIndex) {
-        if (!window.mqtt || !state.roomName) return;
-        const brokerUrl = MQTT_BROKERS[brokerIndex % MQTT_BROKERS.length];
-        const topic = getDiscoveryTopic();
-
-        try {
-          const client = window.mqtt.connect(brokerUrl, {
-            connectTimeout: 5000,
-            reconnectPeriod: 4000,
-            clean: true,
-            clientId: `pokr_${state.myPeerId || Math.random().toString(16).slice(2, 10)}`
-          });
-
-          state.mqttClient = client;
-
-          client.on('connect', () => {
-            if (!state.roomName) return;
-            client.subscribe(topic, { qos: 0 }, (err) => {
-              if (!err) publishPresenceAnnouncement();
-            });
-          });
-
-          client.on('message', (receivedTopic, payloadBuf) => {
-            if (receivedTopic !== topic) return;
-            try {
-              const parsed = JSON.parse(payloadBuf.toString());
-              handlePresenceAnnouncement(parsed);
-            } catch (_) {}
-          });
-
-          client.on('error', () => {
-            try { client.end(true); } catch (_) {}
-            if (brokerIndex + 1 < MQTT_BROKERS.length) {
-              connectMqttDiscovery(brokerIndex + 1);
-            }
-          });
-        } catch (_) {}
+        initPeerInstance(memberPeerId, false);
       }
 
       // -------------------------------------------------------------------
@@ -1637,10 +1979,27 @@
         const amIHost = state.hostPeerId === state.myPeerId;
 
         el.headerMyName.textContent = state.myName;
-        if (isHostVacant) {
+        if (isHostVacant && (!state.isProbingLead || state.isWaitingForLead)) {
           el.vacantLeadBanner.classList.remove('hidden');
+          if (el.waitLeadText) {
+            el.waitLeadText.textContent = state.isWaitingForLead ? 'Waiting…' : 'Wait';
+          }
+          if (el.btnWaitLead) {
+            el.btnWaitLead.disabled = state.isWaitingForLead;
+            el.btnWaitLead.classList.toggle('opacity-60', state.isWaitingForLead);
+          }
         } else {
           el.vacantLeadBanner.classList.add('hidden');
+        }
+
+        if (el.promptVacantLead) {
+          if (isHostVacant && !state.isProbingLead && !state.isWaitingForLead) {
+            el.promptVacantLead.classList.remove('hidden');
+            el.promptVacantLead.classList.add('flex');
+          } else {
+            el.promptVacantLead.classList.add('hidden');
+            el.promptVacantLead.classList.remove('flex');
+          }
         }
 
         if (amIHost) {
@@ -1716,7 +2075,7 @@
       }
 
       function handleRouteChange() {
-        const rawHash = window.location.hash.slice(1);
+        const rawHash = window.location.hash.replace(/^#\/?/, '').trim();
         const sanitized = sanitizeRoomName(rawHash);
 
         if (!sanitized) {
@@ -1753,7 +2112,11 @@
         el.headerRoomName.textContent = sanitized;
 
         const savedSession = loadSessionVoteState(sanitized);
-        if (state.myName && savedSession && savedSession.onboarded) {
+        if (savedSession && savedSession.onboarded && (savedSession.myName || state.myName)) {
+          state.myName = savedSession.myName || state.myName;
+          if (typeof savedSession.myIsObserver === 'boolean') {
+            state.myIsObserver = savedSession.myIsObserver;
+          }
           state.isOnboarded = true;
           startMeshForRoom();
         } else {
@@ -1808,14 +2171,20 @@
       function bindEvents() {
         window.addEventListener('hashchange', handleRouteChange);
 
-        window.addEventListener('beforeunload', () => {
+        const handleUnload = () => {
           if (state.myPeerId) {
             broadcastToMesh({
               type: 'PEER_LEAVING',
               payload: { peerId: state.myPeerId }
             });
           }
-        });
+          if (state.peerInstance) {
+            try { state.peerInstance.destroy(); } catch (_) {}
+          }
+        };
+
+        window.addEventListener('beforeunload', handleUnload);
+        window.addEventListener('pagehide', handleUnload);
 
         el.btnThemeToggle.addEventListener('click', toggleTheme);
 
@@ -1901,10 +2270,24 @@
         el.btnResetBoard.addEventListener('click', triggerResetBoard);
 
         el.btnClaimLead.addEventListener('click', () => {
-          if (state.myPeerId) {
-            assignHostRole(state.myPeerId);
-          }
+          claimLeadByBinding();
         });
+
+        el.btnWaitLead.addEventListener('click', () => {
+          startWaitingForLead();
+        });
+
+        if (el.btnCenterClaimLead) {
+          el.btnCenterClaimLead.addEventListener('click', () => {
+            claimLeadByBinding();
+          });
+        }
+
+        if (el.btnCenterWaitLead) {
+          el.btnCenterWaitLead.addEventListener('click', () => {
+            startWaitingForLead();
+          });
+        }
       }
 
       initTheme();
