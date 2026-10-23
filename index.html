@@ -1783,19 +1783,32 @@
               return;
             }
 
-            // If claiming LEAD_PEER_ID failed because another peer just claimed it,
-            // fall back to an ephemeral member ID and connect to the lead.
-            if (isClaimingLead && err && err.type === 'unavailable-id') {
+            // Handle unavailable-id for BOTH lead claims and regular member joins
+            if (err && err.type === 'unavailable-id') {
               try { peer.destroy(); } catch (_) {}
               state.peerInstance = null;
-              state.peers.delete(state.myPeerId);
-              state.hostPeerId = null;
-              const fallbackMemberId = generateMemberPeerId();
-              state.myPeerId = fallbackMemberId;
-              updateSelfInPeersMap();
-              saveRoomState();
-              initPeerInstance(fallbackMemberId, false);
-              return;
+
+              const leadId = getLeadPeerId();
+              if (requestedId === leadId || isClaimingLead) {
+                // The Lead ID is taken by an active lead on 0.peerjs.com
+                state.peers.delete(leadId);
+                state.hostPeerId = null;
+                const fallbackMemberId = generateMemberPeerId();
+                state.myPeerId = fallbackMemberId;
+                updateSelfInPeersMap();
+                saveRoomState();
+                initPeerInstance(fallbackMemberId, false);
+                return;
+              } else {
+                // Ephemeral member ID was already taken or lingering on 0.peerjs.com from refresh
+                state.peers.delete(state.myPeerId);
+                const freshMemberId = generateMemberPeerId();
+                state.myPeerId = freshMemberId;
+                updateSelfInPeersMap();
+                saveRoomState();
+                initPeerInstance(freshMemberId, false);
+                return;
+              }
             }
 
             if (!state.myPeerId) {
